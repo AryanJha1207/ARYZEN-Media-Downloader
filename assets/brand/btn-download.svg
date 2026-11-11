@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="232" height="44" viewBox="0 0 232 44" role="img" aria-label="Download the installer">
+  <style>
+    .sans { font-family: 'Host Grotesk', Inter, -apple-system, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; }
+    .mono { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+  <rect width="232" height="44" rx="10" fill="#5ab9fc"/>
+  <text class="sans" x="116.0" y="27.2" text-anchor="middle" font-size="15" font-weight="600" fill="#0a0d14">Download the installer</text>
+</svg>

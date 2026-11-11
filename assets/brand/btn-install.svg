@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="232" height="44" viewBox="0 0 232 44" role="img" aria-label="Read the install steps">
+  <style>
+    .sans { font-family: 'Host Grotesk', Inter, -apple-system, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; }
+    .mono { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+  <rect x=".5" y=".5" width="231" height="43" rx="9.5" fill="#131824" stroke="#2a3347"/>
+  <text class="sans" x="116.0" y="27.2" text-anchor="middle" font-size="15" font-weight="600" fill="#e9edf3">Read the install steps</text>
+</svg>
