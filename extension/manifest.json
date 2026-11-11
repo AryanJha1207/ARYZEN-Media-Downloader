@@ -1,0 +1,67 @@
+{
+  "manifest_version": 3,
+  "name": "ARYZEN Media Downloader",
+  "version": "2.0.0",
+  "description": "Save video and audio from pages you browse, at the qualities the site actually offers. Runs fully on your own computer with a local yt-dlp engine.",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "nativeMessaging"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "ARYZEN Media Downloader",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://youtube.com/*",
+        "*://*.instagram.com/*",
+        "*://*.reddit.com/*",
+        "*://*.twitch.tv/*",
+        "*://*.soundcloud.com/*",
+        "*://*.streamable.com/*",
+        "*://*.ted.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtSiMmHtYn0p5Dx3DCLsni0HeSl0unn8vYUeg6zmXSkoLVDEJ0aOSgXrctF259k8R1EcKRwH6zAwACz4ZHymJEbIejAVYvQiQIx4SZ0xJalFGvoMnZ7rKOuI3m3NBgv0yS+4fWNkUyppUrFrRzsncYDzO3Euag5QCEV4kJl1bLDqh8oL/SxaKC3+YHzlBY5WqjtUjiMB1jfYn0pjZ/BAAC/2DO5zTHsAUyVS7WivNGHLLYxxMZ9odtESI4cnEwEybOwV4QFFNRXgaWGxrV6fm8MnL5fSEnhHFo4ciKLZ9fkg6/B1hE0lnIkUdy+EY2oc8PLUJpm9Oi5k2bPA/6/dOaQIDAQAB",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "fonts/ibm-plex-sans-italic-latin.woff2",
+        "icons/tab-mark.png"
+      ],
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://youtube.com/*",
+        "*://*.instagram.com/*",
+        "*://*.reddit.com/*",
+        "*://*.twitch.tv/*",
+        "*://*.soundcloud.com/*",
+        "*://*.streamable.com/*",
+        "*://*.ted.com/*"
+      ]
+    }
+  ]
+}

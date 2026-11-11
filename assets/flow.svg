@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="260" viewBox="0 0 1280 260" role="img" aria-label="How it works: extension, native messaging, local bridge, yt-dlp and FFmpeg, your Downloads folder">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#030714"/><stop offset=".6" stop-color="#081030"/><stop offset="1" stop-color="#150b38"/>
+    </linearGradient>
+    <radialGradient id="cy"><stop offset="0" stop-color="#22d3ee" stop-opacity=".6"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/></radialGradient>
+    <radialGradient id="vi"><stop offset="0" stop-color="#8b5cf6" stop-opacity=".6"/><stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/></radialGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity=".18"/><stop offset=".55" stop-color="#fff" stop-opacity=".04"/><stop offset="1" stop-color="#fff" stop-opacity=".09"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity=".75"/><stop offset=".4" stop-color="#7dd3fc" stop-opacity=".15"/><stop offset=".75" stop-color="#a78bfa" stop-opacity=".2"/><stop offset="1" stop-color="#fff" stop-opacity=".5"/>
+    </linearGradient>
+    <linearGradient id="spec" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset=".5" stop-color="#fff" stop-opacity=".8"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="arrow" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#67e8f9"/><stop offset="1" stop-color="#a78bfa"/></linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="frame"><rect width="1280" height="260" rx="36"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#frame)">
+    <rect width="1280" height="260" fill="url(#bg)"/>
+    <circle cx="200" cy="260" r="300" fill="url(#cy)"/>
+    <circle cx="1100" cy="0" r="300" fill="url(#vi)"/>
+
+    <g font-family="-apple-system,'SF Pro Display','Segoe UI','Helvetica Neue',Arial,sans-serif" text-anchor="middle">
+      <!-- node 1 -->
+      <rect x="65" y="60" width="190" height="140" rx="28" fill="url(#glass)"/>
+      <rect x="65.75" y="60.75" width="188.5" height="138.5" rx="27.5" fill="none" stroke="url(#rim)" stroke-width="1.5"/>
+      <rect x="95" y="62" width="130" height="2" rx="1" fill="url(#spec)"/>
+      <text x="160" y="94" font-size="13" font-weight="700" letter-spacing="3" fill="#67e8f9">01</text>
+      <text x="160" y="130" font-size="19" font-weight="700" fill="#fff">Extension</text>
+      <text x="160" y="156" font-size="13" fill="#9fb6e3">Glass button and</text>
+      <text x="160" y="174" font-size="13" fill="#9fb6e3">quality picker</text>
+
+      <!-- node 2 -->
+      <rect x="305" y="60" width="190" height="140" rx="28" fill="url(#glass)"/>
+      <rect x="305.75" y="60.75" width="188.5" height="138.5" rx="27.5" fill="none" stroke="url(#rim)" stroke-width="1.5"/>
+      <rect x="335" y="62" width="130" height="2" rx="1" fill="url(#spec)"/>
+      <text x="400" y="94" font-size="13" font-weight="700" letter-spacing="3" fill="#67e8f9">02</text>
+      <text x="400" y="130" font-size="19" font-weight="700" fill="#fff">Native messaging</text>
+      <text x="400" y="156" font-size="13" fill="#9fb6e3">Browser to bridge</text>
+      <text x="400" y="174" font-size="13" fill="#9fb6e3">over stdio</text>
+
+      <!-- node 3 -->
+      <rect x="545" y="60" width="190" height="140" rx="28" fill="url(#glass)"/>
+      <rect x="545.75" y="60.75" width="188.5" height="138.5" rx="27.5" fill="none" stroke="url(#rim)" stroke-width="1.5"/>
+      <rect x="575" y="62" width="130" height="2" rx="1" fill="url(#spec)"/>
+      <text x="640" y="94" font-size="13" font-weight="700" letter-spacing="3" fill="#67e8f9">03</text>
+      <text x="640" y="130" font-size="19" font-weight="700" fill="#fff">Local bridge</text>
+      <text x="640" y="156" font-size="13" fill="#9fb6e3">bridge/umd_host.py</text>
+      <text x="640" y="174" font-size="13" fill="#9fb6e3">no shell, fixed args</text>
+
+      <!-- node 4 -->
+      <rect x="785" y="60" width="190" height="140" rx="28" fill="url(#glass)"/>
+      <rect x="785.75" y="60.75" width="188.5" height="138.5" rx="27.5" fill="none" stroke="url(#rim)" stroke-width="1.5"/>
+      <rect x="815" y="62" width="130" height="2" rx="1" fill="url(#spec)"/>
+      <text x="880" y="94" font-size="13" font-weight="700" letter-spacing="3" fill="#67e8f9">04</text>
+      <text x="880" y="130" font-size="19" font-weight="700" fill="#fff">yt-dlp + FFmpeg</text>
+      <text x="880" y="156" font-size="13" fill="#9fb6e3">Fetch, merge video</text>
+      <text x="880" y="174" font-size="13" fill="#9fb6e3">and audio, make MP3</text>
+
+      <!-- node 5 -->
+      <rect x="1025" y="60" width="190" height="140" rx="28" fill="url(#glass)"/>
+      <rect x="1025.75" y="60.75" width="188.5" height="138.5" rx="27.5" fill="none" stroke="url(#rim)" stroke-width="1.5"/>
+      <rect x="1055" y="62" width="130" height="2" rx="1" fill="url(#spec)"/>
+      <text x="1120" y="94" font-size="13" font-weight="700" letter-spacing="3" fill="#67e8f9">05</text>
+      <text x="1120" y="130" font-size="19" font-weight="700" fill="#fff">Downloads/UMD</text>
+      <text x="1120" y="156" font-size="13" fill="#9fb6e3">Your file lands in</text>
+      <text x="1120" y="174" font-size="13" fill="#9fb6e3">your Downloads folder</text>
+    </g>
+
+    <!-- arrows -->
+    <g fill="none" stroke="url(#arrow)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)">
+      <path d="M263 130 H289 M283 123 L290 130 L283 137"/>
+      <path d="M503 130 H529 M523 123 L530 130 L523 137"/>
+      <path d="M743 130 H769 M763 123 L770 130 L763 137"/>
+      <path d="M983 130 H1009 M1003 123 L1010 130 L1003 137"/>
+    </g>
+  </g>
+</svg>

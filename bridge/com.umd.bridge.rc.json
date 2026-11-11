@@ -1,0 +1,9 @@
+{
+  "name": "com.umd.bridge.rc",
+  "description": "ARYZEN Media Downloader local helper (release candidate)",
+  "path": "HOST_LAUNCHER_PATH",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://ddboljfdnkbobcealhpiofknpnjkdaan/"
+  ]
+}

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<div id="panel">
+  <i class="layer tint" aria-hidden="true"></i>
+  <i class="layer cap" aria-hidden="true"></i>
+  <div id="glassrim" aria-hidden="true"></div>
+
+  <div class="brand"><span class="brandname">AMD</span><span class="brandver" id="extver"></span></div>
+  <button id="closex" aria-label="Close">&times;</button>
+
+  <div class="content">
+    <header>
+      <span class="headleft"><img class="headart" src="icons/tab-mark.png" alt=""><span class="headtitle">ARYZEN Media Downloader</span></span>
+      <span id="conn" class="pill"><i></i>checking...</span>
+    </header>
+
+    <section id="setup" hidden>
+      <h2>Local helper not found</h2>
+      <p>This extension talks to a small helper on your computer (yt-dlp + ffmpeg). It has not been set up yet, or your browser needs a restart.</p>
+      <ol>
+        <li>Download the <b>ARYZEN-Media-Downloader</b> zip for your system (Windows / Mac / Linux) from the project's GitHub Releases page and extract it.</li>
+        <li>Run <b>Install ARYZEN Media Downloader</b> inside and let it finish.</li>
+        <li>Restart your browser, then reopen this popup.</li>
+      </ol>
+      <p class="dim" id="setup-err"></p>
+    </section>
+
+    <section id="main" hidden>
+      <button id="usetab" class="primary big hero">&#11015; Download from this tab</button>
+
+      <div class="or"><span>or paste a link</span></div>
+      <div class="urlrow">
+        <input id="url" type="url" placeholder="Paste a video or audio link" spellcheck="false" autocomplete="off">
+        <button id="check" class="primary">Check</button>
+      </div>
+
+      <div id="status" class="status" hidden></div>
+
+      <div id="info" class="info" hidden>
+        <img id="thumb" alt="" hidden>
+        <div>
+          <div id="title" class="title"></div>
+          <div id="meta" class="dim"></div>
+        </div>
+      </div>
+
+      <div id="options"></div>
+
+      <button id="download" class="primary big" hidden>Download</button>
+
+      <div id="progress" hidden>
+        <div class="phead"><span id="ptitle" class="ptitle">Downloading</span><span id="ppct"></span></div>
+        <div class="bar"><div id="fill"></div></div>
+        <div id="ptext" class="dim"></div>
+        <button id="cancel" class="link">Cancel</button>
+      </div>
+
+      <div id="done" hidden>
+        <div id="donetext"></div>
+        <div class="row">
+          <button id="openfolder">Open folder</button>
+          <button id="again" class="link">New download</button>
+        </div>
+      </div>
+
+      <div class="quick">
+        <button id="openfolder2" class="link">Open downloads folder</button>
+      </div>
+    </section>
+
+    <footer>
+      <span id="eng">engine: ...</span>
+      <a href="#" id="update">update engine</a>
+    </footer>
+  </div>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>
