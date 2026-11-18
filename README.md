@@ -30,9 +30,9 @@ Also supported: Streamable and TED.
 
 - A **browser extension** adds the Download button and quality picker to the supported sites.
 - A tiny **local bridge** (`bridge/umd_host.py`) talks to the extension through native messaging and runs yt-dlp for you.
-- **yt-dlp** fetches the media; **FFmpeg** merges video and audio and converts to MP3.
+- **yt-dlp** fetches the media; **FFmpeg** merges video and audio and converts to MP3; **Deno** supplies the JavaScript runtime current yt-dlp needs for YouTube's challenges.
 
-Everything runs locally on your machine. No accounts, no servers, no tracking.
+Everything runs on your own machine: the app talks to the video sites directly from your computer, and there is no separate hosted downloader service. No accounts, no tracking.
 
 ## Install
 
@@ -40,8 +40,8 @@ Everything runs locally on your machine. No accounts, no servers, no tracking.
 
 | OS | What you need first |
 | :-- | :-- |
-| macOS | Nothing. The installer bundles a standalone Python runtime and FFmpeg, both checksum-verified. |
-| Windows | Python 3.11+ on your PATH (python.org, tick "Add python.exe to PATH"). Current yt-dlp releases refuse to run on older Python (verified against yt-dlp 2026.10.26 on Python 3.10). FFmpeg and FFprobe are downloaded and checksum-verified by the installer. |
+| macOS | Nothing. The installer bundles a standalone Python runtime, FFmpeg and Deno, all checksum-verified. |
+| Windows | Python 3.11+ on your PATH (python.org, tick "Add python.exe to PATH"). Current yt-dlp releases refuse to run on older Python (verified against yt-dlp 2026.10.26 on Python 3.10). FFmpeg, FFprobe and Deno are downloaded and checksum-verified by the installer. |
 | Linux | `python3` 3.11+, `curl`, and `ffmpeg` (which includes `ffprobe`) from your package manager. The installer downloads no FFmpeg, because no static-build source we found publishes checksums; your distro's package is signature-verified. |
 
 On Linux, install the packages with your package manager:
@@ -150,7 +150,22 @@ Verified so far, without a browser in the loop:
 
 **2026-11-11, cross-platform audit.** An audit of the installers and bridge fixed three real bugs. The "open downloads folder" action used the macOS-only `open` command on every OS; it now dispatches to each platform's opener (`os.startfile` on Windows, `open` on macOS, `xdg-open` on Linux). The Linux and Windows installs shipped FFmpeg without FFprobe, which yt-dlp expects next to it; Linux now requires and links the distro `ffprobe`, and Windows now copies `ffprobe.exe` from the same checksum-verified archive. The Windows version footer queried `ffmpeg` without its `.exe` name. The Linux fixes were re-verified by re-running the rebuilt installer end-to-end; the macOS and Windows edits are static-review only, still untested on real machines.
 
-**Still not done:** any run on a real Mac or Windows machine, the Windows installer (no PowerShell runtime was available to test it; a first real Windows 10 test is planned by the author), and the browser-to-bridge hop of this RC (extension loaded in a real browser talking through the registered native-messaging manifest; the cloud test browser cannot install native-messaging hosts). Treat those as untested until the table above changes.
+**2026-11-12 (v2.1.0).** Four changes landed, tested on Linux with the real engine and in a Chromium extension rig against a local fixture feed:
+
+- **Player targeting**: on supported feeds, drag the floating Download button onto a player (or park it over one and click) to target THAT video instead of the page URL - it resolves the enclosing post's permalink, a cross-origin embed's readable `src`, or a direct progressive media URL, in that preference order. Dropping it on a player that only exposes blob/MSE fragments marks the target unresolved and says so, instead of silently probing the page (which on a feed could fetch the wrong video). Dropping it on empty space returns to page mode. Clicking re-validates what is under the button at click time, so a stale target survives neither scrolling nor recycled feed nodes.
+- **Hover preparation**: the first hover on the button starts reading the current target in the background (60-second budget, silent on failure, once per page/target), so the menu usually opens with options already waiting. Only successful answers are cached (180 seconds); a failed or expired prefetch never blocks the click's own fresh probe, and a click during an in-flight prefetch joins it instead of starting a competing one.
+- **Faster download starts**: a successful probe's raw engine answer is kept for 120 seconds in a private temp folder (owner-only permissions, deleted after use/expiry, swept at bridge start), and a download started in that window skips the second extraction. If the saved answer has gone stale (the media URL expired: HTTP 403/404/410 on the video-data fetch), the bridge retries once with a fresh read; it never retries after a cancel, a disk or permission failure, or once post-processing has started.
+- **Codec classification fix**: format lists reporting `vcodec: null` with a height (seen on Streamable) now correctly count as video instead of "no downloadable formats"; audio-only and image entries were regression-tested unchanged.
+
+Also in this pass: a probe that needs more than 8 seconds now reports that it is still working and keeps going up to a 45-second cap instead of erroring out, and all three installers bundle the Deno JavaScript runtime that current yt-dlp needs for YouTube's JS challenges.
+
+**Honest limits of the 2026-11-12 pass:** the targeting tests ran against a LOCAL fixture feed (including Reddit-like post cards), not live sites - a logged-out live Reddit check was attempted, and Reddit answered the datacenter test browser with a human-verification page, so targeting on live Reddit stays unverified until a real-machine pass. All three installers also gained a Deno download/verify stage in this pass: the Linux and macOS stages were exercised standalone on Linux and the Windows stage under PowerShell 7.4.6 on Linux; no full installer re-run on any OS has happened since, so the 2026-11-10/11 end-to-end installer results describe the pre-Deno installers. The author's report that initial fetching is slower on Windows than on his Mac is under investigation with a one-off diagnostic and is NOT claimed fixed.
+
+**2026-11-17 (v2.2.0).** The floating Download button and the toolbar popup now render their glass with the WebGL [liquidglass](https://github.com/ybouane/liquidglass) library (MIT): the button refracts the live page behind it, the popup refracts a one-time snapshot of the page taken when it opens, and both fall back to the previous SVG effect automatically where WebGL is unavailable. A race that left a displaced duplicate layer behind the download menu while it loaded is fixed (the menu's look is unchanged). Verified in a real Chromium extension load: pill glass renders, popup glass renders, the menu's frost layer sits exactly on the card in both the loading and settled states, and the SVG fallback paths engage with WebGL disabled. Not exercised on a real Mac or Windows machine.
+
+**2026-11-18 (v2.2.0).** Real-machine testing on macOS (Brave) found the WebGL glass engine from the previous entry freezing the page on heavy sites and collapsing the toolbar popup to zero height. The engine is removed; v2.2.0 ships the hand-ported SVG glass on the pill and the layered-gradient glass in the popup (the previously approved looks), with the menu race fix from the previous entry retained. Verified in a real Chromium extension load: pill renders with the SVG effect (hover, click and drag all work), the popup opens at full size, the menu's frost layer sits exactly on the card in both the loading and settled states.
+
+**Still not done:** any run on a real Mac or Windows machine of this tree, the Windows installer (no PowerShell runtime was available to test it; a first real Windows 10 test is planned by the author), live-site validation of player targeting, and the browser-to-bridge hop of this RC (extension loaded in a real browser talking through the registered native-messaging manifest; the cloud test browser cannot install native-messaging hosts). Treat those as untested until the table above changes.
 
 </details>
 
@@ -190,7 +205,9 @@ Your original October 2026 install, if you have one, is untouched by all of this
 
 ## Credits
 
-The floating Download button's refraction effect is a JavaScript/SVG port of the geometry and render passes from [liquid_glass_widgets](https://github.com/sdegenaar/liquid_glass_widgets) by Sebastian Degenaar (pixel-innovations.com), MIT License, which builds on [liquid_glass_renderer](https://github.com/whynotmake-it/flutter_liquid_glass) by Tim Lehmann (whynotmake.it), MIT License (as vendored upstream). The pill's rounded-rect SDF, spherical-cap surface normal, Snell refraction and RGB chromatic dispersion follow their shaders (`shaders/sdf.glsl`, `shaders/liquid_glass_geometry_blended.frag`, `shaders/liquid_glass_render.frag`). The port bakes the displacement into an SVG `feDisplacementMap` driven through Chromium's `backdrop-filter: url()`. Full license texts, copyright notices and the exact ported revision are in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES), and the notices are carried in `extension/content.js`.
+The floating Download button's and the toolbar popup's glass is the hand-ported SVG effect described below. (A WebGL glass engine, [liquidglass](https://github.com/ybouane/liquidglass), was evaluated for v2.2.0 and removed after it froze the page on a real Mac; the SVG effect is what ships.) Full license texts are in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+
+The floating Download button's original refraction effect is a JavaScript/SVG port of the geometry and render passes from [liquid_glass_widgets](https://github.com/sdegenaar/liquid_glass_widgets) by Sebastian Degenaar (pixel-innovations.com), MIT License, which builds on [liquid_glass_renderer](https://github.com/whynotmake-it/flutter_liquid_glass) by Tim Lehmann (whynotmake.it), MIT License (as vendored upstream). The pill's rounded-rect SDF, spherical-cap surface normal, Snell refraction and RGB chromatic dispersion follow their shaders (`shaders/sdf.glsl`, `shaders/liquid_glass_geometry_blended.frag`, `shaders/liquid_glass_render.frag`). The port bakes the displacement into an SVG `feDisplacementMap` driven through Chromium's `backdrop-filter: url()`. Full license texts, copyright notices and the exact ported revision are in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES), and the notices are carried in `extension/content.js`.
 
 The download menu's typeface is [IBM Plex Sans](https://github.com/IBM/plex) (italic), SIL Open Font License 1.1 (full text in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)); the latin italic variable subset is bundled at `extension/fonts/ibm-plex-sans-italic-latin.woff2`. The menu floats centered over an untouched page, with no backdrop tint or page blur, and the same refraction port drives the menu's glass, computed against its raised top-right silhouette.
 

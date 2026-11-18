@@ -31,7 +31,7 @@
   // Same request/response contract as the toolbar popup: a command gets an
   // immediate ack {ok, id}; the real answer arrives later as {umd: {...}}
   // with a matching id. Events (progress/done/error) carry the job id.
-  function send(cmd, extra, timeoutMs) {
+  function send(cmd, extra, timeoutMs, onWorking) {
     return new Promise((resolve) => {
       let resp;
       try {
@@ -46,11 +46,20 @@
             return;
           }
           const id = resp.id;
-          const timer = setTimeout(() => {
+          const deadAnswer = () => {
             chrome.runtime.onMessage.removeListener(onMsg);
             resolve({ ok: false, error: "No answer from the local helper. Open the extension popup and click Check; if it repeats, run the installer again and restart your browser." });
-          }, timeoutMs || 15000);
+          };
+          let timer = setTimeout(deadAnswer, timeoutMs || 15000);
           function onMsg(m) {
+            // The helper is alive but still reading the page: extend the
+            // wait to its stated cap and update the loading note.
+            if (m && m.umd && m.umd.id === id && m.umd.type === "probe-working") {
+              clearTimeout(timer);
+              timer = setTimeout(deadAnswer, ((m.umd.cap || 45) + 10) * 1000);
+              if (onWorking) { try { onWorking(m.umd); } catch (e) {} }
+              return;
+            }
             if (m && m.umd && m.umd.id === id && (m.umd.type === "result" || m.umd.type === "error")) {
               clearTimeout(timer);
               chrome.runtime.onMessage.removeListener(onMsg);
@@ -66,6 +75,13 @@
   }
 
   // Job-scoped events (progress / done / error) for the active download.
+  // Toolbar button: the service worker asks us to open the menu in-page
+  // (liquid-glass card) instead of a browser-owned popup window.
+  chrome.runtime.onMessage.addListener((m, sender, sendResponse) => {
+    if (m && m.umdMenu === "open") { openOverlay(true); sendResponse({ ok: true }); }
+    return false;
+  });
+
   const jobListeners = new Set();
   chrome.runtime.onMessage.addListener((m) => {
     const g = m && m.umd;
@@ -218,21 +234,27 @@
   // raised tab with an angled shoulder, per the user's reference. One vertex
   // list drives BOTH the CSS clip-path and the glass displacement SDF, so the
   // refraction follows the exact silhouette, shoulder included.
-  const CARD_TAB_W = 196, CARD_RISE = 30, CARD_SHOULDER = 34, CARD_R = 20, CARD_TAB_R = 13;
+  // The tab rises from the card edge on a smoothstep S-curve (flat tangents at
+  // both ends), the way the liquid swirls in the ARYZEN mark lift off its body.
+  const CARD_TAB_W = 204, CARD_RISE = 34, CARD_SHOULDER = 46, CARD_R = 26, CARD_TAB_R = 15;
   function umdCardShape(W, H) {
-    const R = CARD_R, T = CARD_TAB_R, tw = CARD_TAB_W, y0 = CARD_RISE, sh = CARD_SHOULDER;
+    const R = CARD_R, T = CARD_TAB_R, y0 = CARD_RISE, sh = CARD_SHOULDER;
+    // keep the shoulder clear of the top-left corner on very narrow cards
+    const tw = Math.min(CARD_TAB_W, Math.max(120, W - R - sh - 10));
     const pts = [];
     function arc(cx, cy, r, a0, a1) {
-      const n = 4;
+      const n = 8;
       for (let i = 0; i <= n; i++) {
         const a = a0 + (a1 - a0) * i / n;
         pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
       }
     }
-    arc(R, y0 + R, R, Math.PI, Math.PI * 1.5);        // main top-left corner
-    pts.push([W - tw - sh, y0]);                       // top edge to the shoulder
-    pts.push([W - tw, T]);                             // angled shoulder up
-    arc(W - tw + T, T, T, Math.PI, Math.PI * 1.5);     // tab top-left corner
+    arc(R, y0 + R, R, Math.PI, Math.PI * 1.5);         // main top-left corner
+    const xa = W - tw - sh, xb = W - tw + 16, steps = 14;
+    for (let i = 0; i <= steps; i++) {                 // liquid shoulder, card edge up to tab
+      const u = i / steps, s = u * u * (3 - 2 * u);
+      pts.push([xa + (xb - xa) * u, y0 * (1 - s)]);
+    }
     pts.push([W - T, 0]);                              // tab top edge
     arc(W - T, T, T, Math.PI * 1.5, Math.PI * 2);      // tab top-right corner
     pts.push([W, H - R]);                              // right edge down
@@ -266,6 +288,58 @@
       const d = Math.sqrt(d2);
       return inside ? -d : d;
     };
+  }
+
+  // ---------------- ybouane/liquidglass WebGL pill (approved 2026-11-17) ---
+  // The floating pill's material is the ybouane/liquidglass WebGL library
+  // (extension/lib/liquidglass-content.js, MIT;
+  // https://github.com/ybouane/liquidglass): the page is rasterized once and
+  // the pill renders as a true refractive lens over it - frost blur, Snell
+  // refraction, chromatic aberration, Fresnel edge light - the exact style
+  // the user approved in the preview. The SVG-displacement build above stays
+  // as the fallback when the library/WebGL is unavailable, and the download
+  // card keeps using it regardless (the card's look is unchanged by this).
+  let umdLGInstance = null;
+
+  async function umdGlassifyPill(b) {
+    const lib = window.UMDLiquidGlass;
+    if (!lib || !lib.LiquidGlass || !document.body) return;
+    let inst = null;
+    try {
+      b.dataset.config = JSON.stringify({
+        floating: false,   // our own drag (with position memory) stays in charge
+        button: true,      // library hover/press shading + crisp content
+        blurAmount: 0.3,
+        brightness: -0.25, // keeps the white label readable (approved preview)
+        cornerRadius: 22,
+        zRadius: 40,
+      });
+      inst = await lib.LiquidGlass.init({ root: document.body, glassElements: [b] });
+    } catch (e) {
+      return; // keep the SVG-filter fallback look
+    }
+    // The library pins user-select:none on its root; the root is the page's
+    // body here, so restore it or the whole page loses text selection.
+    document.body.style.userSelect = "";
+    // A SPA navigation may have swapped the pill while init was running.
+    if (document.getElementById(BTN_ID) !== b || !document.body.contains(b)) {
+      try { inst.destroy(); } catch (e) {}
+      return;
+    }
+    if (umdLGInstance) { try { umdLGInstance.destroy(); } catch (e) {} }
+    umdLGInstance = inst;
+    // The shader canvas now supplies the material: drop the hand-layered
+    // parts (refraction backdrop, prismatic rim, light cap, sheen) and the
+    // manual border/shadow - the shader draws its own edge light and shadow.
+    if (b._umdLayers) for (const l of b._umdLayers) l.remove();
+    b.style.border = "0";
+    b.style.boxShadow = "none";
+    b._umdLG = true;
+    // No manual hover lift in library mode: transforming the glass element
+    // forces a full lens re-render on every transition frame, and the
+    // button:true config already supplies the approved hover/press shading.
+    b.onmouseenter = null;
+    b.onmouseleave = null;
   }
 
   // Measure the rendered pill, then swap the initial plain blur for the real
@@ -333,7 +407,7 @@
         dragging = true;
         b._umdDragMoved = true;
         try { b.setPointerCapture(pid); } catch (err) {}
-        b.style.transform = "none"; // drop the hover lift while dragging
+        if (!b._umdLG) b.style.transform = "none"; // drop the hover lift while dragging (SVG fallback only)
         b.style.cursor = "grabbing";
       }
       e.preventDefault();
@@ -346,7 +420,8 @@
       if (dragging) {
         dragging = false;
         umdSavePos(b);
-        b.style.transform = b.matches(":hover") ? "translateY(-2px) scale(1.04)" : "";
+        umdUpdateTarget(b); // dropped over a player? target it; elsewhere: clear
+        if (!b._umdLG) b.style.transform = b.matches(":hover") ? "translateY(-2px) scale(1.04)" : "";
       }
     };
     b.addEventListener("pointerup", end);
@@ -358,6 +433,13 @@
     b.id = BTN_ID;
     b.type = "button";
     b.setAttribute("aria-label", "Download this media with ARYZEN Media Downloader");
+    b.addEventListener("pointerenter", () => prefetchProbe());
+    if (!document.getElementById("umd-target-style")) {
+      const st = document.createElement("style");
+      st.id = "umd-target-style";
+      st.textContent = ".umd-targeting{outline:2px solid #7ec8ff !important;outline-offset:2px !important}";
+      (document.head || document.documentElement).appendChild(st);
+    }
     // The floating pill carries the user's ARYZEN vector art (the same A
     // artwork as the menu's raised tab); the anchored YouTube-row button
     // keeps the plain download arrow that matches that row's own icons.
@@ -458,6 +540,9 @@
       b.appendChild(tint);
       b.appendChild(cap);
       b.appendChild(sheen);
+      // Hand-layered glass parts, kept together so the WebGL upgrade
+      // (umdGlassifyPill) can remove them when it takes over.
+      b._umdLayers = [glassBg, tint, cap, sheen];
       b.onmouseenter = () => {
         b.style.transform = "translateY(-2px) scale(1.04)";
         b.style.boxShadow = glassShadowHover;
@@ -474,12 +559,19 @@
     e.preventDefault(); e.stopPropagation();
     // The click that lands right after a drag must not open the menu.
     if (b._umdDragMoved) { b._umdDragMoved = false; return; }
+    // "Drag it over the video and click": a pill parked over a player targets
+    // that media on click; parked anywhere else, the click reads the page.
+    umdUpdateTarget(b);
     openOverlay();
   };
     return b;
   }
 
   function ensureButton() {
+    // Injected by the toolbar click onto an ordinary page: the menu only,
+    // never the floating Download pill (that belongs to the supported sites
+    // declared in the manifest).
+    if (window.__umdMenuOnly) return;
     if (!document.body) return;
     const existing = document.getElementById(BTN_ID);
     if (isYTWatch) {
@@ -514,6 +606,9 @@
         umdAttachDrag(nb);
         umdRestorePos(nb);
         requestAnimationFrame(() => applyLiquidGlass(nb));
+        // Progressive upgrade: swap the pill's material to the WebGL
+        // library once it has initialized; the SVG build is the fallback.
+        umdGlassifyPill(nb);
       });
     }
   }
@@ -528,8 +623,37 @@
 
   ensureButton();
   setInterval(ensureButton, 1500); // SPA re-renders can drop injected nodes
-  window.addEventListener("yt-navigate-finish", () => setTimeout(ensureButton, 400));
-  window.addEventListener("spfdone", () => setTimeout(ensureButton, 400));
+
+  // Cold-start pre-warm: the first launch of the local helper and the first
+  // engine run can take many seconds on a cold machine. Start the helper as
+  // soon as this supported page loads, so the first button click is warm.
+  // Fire-and-forget, once per page load; the bridge-side ping is instant.
+  (function prewarm() {
+    try {
+      chrome.runtime.sendMessage({ to: "bridge", cmd: "ping" }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch (e) {}
+  })();
+  const onNav = () => setTimeout(() => {
+    pageProbeSent = false; targetOverride = null; probeCache.clear(); ensureButton();
+    if (isMediaPage(location.href)) prefetchProbe(); // warm the new page early
+  }, 400);
+  window.addEventListener("yt-navigate-finish", onNav);
+  window.addEventListener("spfdone", onNav);
+  // Other SPAs (Twitch etc.) change the URL without events the page exposes;
+  // watch it so a probe cache entry never outlives the video it belongs to.
+  let lastNavKey = mediaKey(location.href);
+  setInterval(() => {
+    const k = mediaKey(location.href);
+    if (k !== lastNavKey) {
+      lastNavKey = k; pageProbeSent = false; probeCache.clear();
+      if (isMediaPage(location.href)) prefetchProbe();
+    }
+  }, 1000);
+  // First-open warmth: on a media page, start the probe shortly after load
+  // instead of waiting for the first hover.
+  setTimeout(() => { if (isMediaPage(location.href)) prefetchProbe(); }, 900);
 
   // -------------------------------------------------------------- the overlay
   const OVERLAY_CSS = `
@@ -541,6 +665,15 @@
     :host { all: initial; }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     .umd-backdrop {
+      /* Palette taken from the ARYZEN mark: ink-navy body, electric blue and
+         cyan on the lit faces, violet on the shadow side. The site accent is
+         only used to say where the media came from. */
+      --blue: #1f8bff; --sky: #52c8ff; --violet: #7a5cff; --lilac: #c2b6ff;
+      --text: #f2f6ff; --text2: #bdc9e3; --text3: #97a6c8;
+      --edge: rgba(150,196,255,.20); --edge-hi: rgba(150,215,255,.55);
+      --well: rgba(4,7,22,.46);
+      --well-inset: inset 0 1px 3px rgba(0,0,0,.38), 0 1px 0 rgba(190,220,255,.07);
+      --ring: 0 0 0 3px rgba(60,160,255,.30);
       position: fixed; inset: 0; z-index: 2147483647;
       /* no tint, no page blur: the page stays clear and the menu floats
          centered above it; the glass material lives inside the card only */
@@ -560,7 +693,7 @@
     .umd-card {
       position: relative;
       width: 100%; max-height: inherit;
-      color: #f2f4f8;
+      color: var(--text);
       /* NO filter or transform on the card or any glass ancestor: either one
          makes the card its own backdrop root, and the glass layers would then
          sample an empty backdrop (no refraction, no frost). The soft shadow
@@ -572,190 +705,220 @@
          element itself would cut the blur off at a hard silhouette edge */
       filter: blur(40px); transform: translateY(20px) scale(.965);
     }
-    .umd-cardshadowshape {
-      position: absolute; inset: 0; display: block;
-      background: rgba(4,6,10,.34);
-    }
-    /* Layered liquid glass, same recipe as the Download pill: a refraction
-       layer (SVG displacement of the page behind), tint, top light cap and a
-       silhouette rim. The card's clip-path cuts everything to the raised
-       top-right silhouette. */
+    .umd-cardshadowshape { position: absolute; inset: 0; display: block; background: rgba(4,6,10,.34); }
+    /* Material, back to front: the frost + refraction sibling (docGlass, outside
+       this shadow root), then in-card tint, top light, one entrance sweep and
+       the silhouette rim. The card's clip-path cuts all of it to the tab shape. */
     .umd-cardlayer { position: absolute; inset: 0; display: block; pointer-events: none; }
-    /* The actual frost + refraction lives on a document-level sibling (see
-       docGlass in openOverlay): in the Chrome build tested 2026-11-11,
-       backdrop-filter: url() did not render on shadow-tree elements. */
+    /* Old liquid-glass body (same material as the floating button): light
+       neutral washes over the refracted page, no navy ink, no colour pools. */
     .umd-cardtint {
-      background: linear-gradient(155deg, rgba(255,255,255,.16), rgba(255,255,255,.02) 32%, rgba(96,140,255,.08) 70%, rgba(160,190,255,.05));
+      background:
+        linear-gradient(155deg, rgba(255,255,255,.16), rgba(255,255,255,.02) 32%, rgba(96,140,255,.08) 70%, rgba(160,190,255,.05)),
+        /* the button's neutral scrim: white text stays readable over bright
+           pages without tinting the glass */
+        linear-gradient(rgba(20,20,26,.34), rgba(20,20,26,.34));
     }
     .umd-cardcap {
       background: linear-gradient(180deg, rgba(255,255,255,.20), rgba(255,255,255,.03) 30%, transparent 55%);
     }
+    .umd-cardsheen { overflow: hidden; }
+    .umd-cardsheen::before {
+      content: ""; position: absolute; top: -10%; bottom: -10%; left: -40%; width: 38%;
+      background: linear-gradient(100deg, transparent, rgba(255,255,255,.22) 45%, rgba(255,255,255,.14) 55%, transparent);
+      transform: skewX(-16deg);
+      animation: umd-sweep 1.2s .28s cubic-bezier(.3,.6,.2,1) 1 both;
+    }
+    @keyframes umd-sweep {
+      from { transform: translateX(0) skewX(-16deg); }
+      to { transform: translateX(420%) skewX(-16deg); }
+    }
     .umd-cardrim { position: absolute; inset: 0; display: block; pointer-events: none; filter: drop-shadow(0 0 7px rgba(255,255,255,.38)); }
     .umd-content { position: relative; z-index: 1; display: flex; flex-direction: column; max-height: inherit; }
     .umd-backdrop.umd-in .umd-cardwrap { transform: scale(1) translateY(0); opacity: 1; }
-    .umd-head {
-      display: flex; align-items: center; gap: 10px;
-      /* the 30px top margin keeps this row below the card's raised tab */
-      margin-top: 30px;
-      padding: 14px 18px; border-bottom: 1px solid rgba(255,255,255,.10);
-      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.01));
-    }
+
+    /* ---- raised tab: brand at its start, close at its end ---- */
     .umd-brand {
-      /* sits at the START (left end) of the raised top-right tab, just past
-         the angled shoulder; the Mac-style close button caps the tab's right */
-      position: absolute; top: 4px; left: calc(100% - 158px); z-index: 2;
-      display: flex; align-items: center; gap: 7px; height: 24px;
+      position: absolute; top: 5px; left: calc(100% - 168px); z-index: 2;
+      display: flex; align-items: center; gap: 8px; height: 24px;
     }
     .umd-brand img { height: 20px; width: auto; display: block; }
-    .umd-brandname {
-      font-size: 13px; font-weight: 700; letter-spacing: .22em; color: #fff;
-      text-shadow: 0 1px 4px rgba(0,0,0,.55), 0 0 10px rgba(0,0,0,.3);
-    }
-    .umd-chip img { width: 14px; height: 14px; border-radius: 3px; }
-    .umd-headtitle { font-size: 16px; font-weight: 700; letter-spacing: .01em; color: #eef1f7; flex: 1; text-shadow: 0 1px 3px rgba(0,0,0,.5), 0 0 10px rgba(0,0,0,.28); }
+    .umd-brandname { font-size: 12.5px; font-weight: 700; letter-spacing: .2em; color: var(--text); }
     .umd-x {
-      /* macOS traffic-light close: red dot at the right end of the raised
-         tab; the glyph fades in on hover like the real thing */
-      position: absolute; top: 9px; right: 15px; z-index: 2;
-      width: 15px; height: 15px; padding: 0; border-radius: 50%; border: 0; cursor: pointer;
-      background: #ff5f57; color: rgba(0,0,0,0);
-      font-size: 11px; font-style: normal; font-weight: 700; line-height: 15px; text-align: center;
-      box-shadow: inset 0 0 0 .5px rgba(0,0,0,.18), 0 1px 2px rgba(0,0,0,.18);
-      transition: background .12s ease, color .12s ease;
+      position: absolute; top: 6px; right: 18px; z-index: 2;
+      width: 22px; height: 22px; padding: 0; border-radius: 50%; cursor: pointer;
+      display: grid; place-items: center; color: var(--text);
+      border: 1px solid rgba(180,215,255,.34);
+      background: radial-gradient(circle at 35% 25%, rgba(255,255,255,.26), rgba(255,255,255,.05) 72%);
+      transition: background .15s ease, border-color .15s ease, transform .12s ease;
     }
-    .umd-cardwrap:hover .umd-x { color: rgba(96,4,0,.8); }
-    .umd-x:hover { background: #ff3b30; }
-    .umd-body { padding: 18px; overflow-y: auto; }
-    .umd-main { display: flex; gap: 18px; }
+    .umd-x::before { content: ""; position: absolute; inset: -6px; border-radius: 50%; }
+    .umd-x svg { width: 10px; height: 10px; transition: transform .22s cubic-bezier(.3,.7,.2,1); }
+    .umd-x:hover { border-color: var(--edge-hi); background: radial-gradient(circle at 35% 25%, rgba(255,255,255,.40), rgba(82,200,255,.12) 72%); }
+    .umd-x:hover svg { transform: rotate(90deg); }
+    .umd-x:active { transform: scale(.92); }
+
+    /* ---- header, paste row, body ---- */
+    .umd-head {
+      display: flex; align-items: center; gap: 10px;
+      /* the 34px top margin keeps this row below the card's raised tab (CARD_RISE) */
+      margin-top: 34px; padding: 16px 22px 8px; flex: none;
+    }
+    .umd-headtitle { font-size: 18px; font-weight: 650; letter-spacing: -.005em; color: var(--text); flex: 1; }
+    .umd-body { padding: 10px 22px 22px; overflow-y: auto; min-height: 0; }
+    /* toolbar-opened menu: the popup's paste-a-link control, on the same card */
+    .umd-pasterow { display: flex; gap: 10px; padding: 4px 22px 4px; flex: none; }
+    .umd-pasterow .umd-pasteinput {
+      flex: 1; min-width: 0; height: 42px; background: var(--well); color: var(--text);
+      border: 1px solid var(--edge); border-radius: 12px; box-shadow: var(--well-inset);
+      padding: 0 14px; font-size: 14px; font-weight: 550; font-family: inherit;
+      outline: none; transition: border-color .15s ease, box-shadow .15s ease;
+    }
+    .umd-pasterow .umd-pasteinput::placeholder { color: var(--text3); }
+    .umd-pasterow .umd-pasteinput:hover { border-color: rgba(120,190,255,.50); }
+    .umd-pasterow .umd-pasteinput:focus { border-color: var(--sky); box-shadow: var(--well-inset), var(--ring); }
+    .umd-pasterow .umd-pastebtn { flex: none; height: 42px; padding: 0 18px; font-size: 13.5px; }
+    .umd-pasterow .umd-pasteinput:disabled, .umd-pasterow .umd-pastebtn:disabled { opacity: .55; pointer-events: none; }
+
+    /* ---- ready: media on the left, choices on the right ---- */
+    .umd-main { display: flex; gap: 20px; }
     .umd-left { width: 254px; flex: none; }
     .umd-thumbwrap {
-      position: relative; width: 254px; height: 143px; border-radius: 12px; overflow: hidden;
-      background: linear-gradient(135deg, rgba(255,255,255,.10), rgba(255,255,255,.03));
-      border: 1px solid rgba(255,255,255,.12);
+      position: relative; width: 100%; aspect-ratio: 16 / 9; border-radius: 16px; overflow: hidden;
+      background: linear-gradient(135deg, rgba(40,140,255,.16), rgba(122,92,255,.10));
+      border: 1px solid var(--edge);
       display: flex; align-items: center; justify-content: center;
+    }
+    .umd-thumbwrap::after {
+      content: ""; position: absolute; inset: 0; pointer-events: none; border-radius: inherit;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.08), inset 0 -34px 36px -30px rgba(3,5,20,.55);
     }
     .umd-thumbwrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
     .umd-thumbph {
-      width: 52px; height: 52px; border-radius: 14px; background: ACCENT33;
+      width: 52px; height: 52px; border-radius: 16px;
+      background: linear-gradient(145deg, ACCENT88, ACCENT33); border: 1px solid ACCENT88;
       display: flex; align-items: center; justify-content: center;
       font-size: 24px; font-weight: 800; color: #fff;
     }
     .umd-dur {
-      position: absolute; right: 7px; bottom: 7px;
-      background: rgba(0,0,0,.78); color: #fff; font-size: 11px; font-weight: 600;
-      padding: 2px 7px; border-radius: 6px;
+      position: absolute; right: 8px; bottom: 8px; z-index: 1;
+      background: rgba(6,9,28,.66); color: #fff; font-size: 11.5px; font-weight: 600;
+      font-variant-numeric: tabular-nums; padding: 3px 8px; border-radius: 8px;
+      border: 1px solid rgba(255,255,255,.14);
+      -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
     }
     .umd-title {
-      margin-top: 11px; font-size: 15px; font-weight: 700; letter-spacing: -.005em; line-height: 1.35; color: #f5f7fb; text-shadow: 0 1px 3px rgba(0,0,0,.5), 0 0 10px rgba(0,0,0,.28);
+      margin-top: 12px; font-size: 15px; font-weight: 650; letter-spacing: -.005em; line-height: 1.35; color: var(--text);
       display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
     }
-    .umd-uploader { margin-top: 4px; font-size: 13px; font-weight: 500; color: #c3cbda; text-shadow: 0 1px 3px rgba(0,0,0,.45), 0 0 8px rgba(0,0,0,.25); }
-    .umd-right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-    .umd-label { font-size: 11.5px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: #ccd4e3; text-shadow: 0 1px 3px rgba(0,0,0,.45), 0 0 8px rgba(0,0,0,.25); margin-bottom: 7px; }
-    .umd-selectwrap { position: relative; }
+    .umd-uploader { margin-top: 4px; font-size: 13px; font-weight: 500; color: var(--text2); }
+    /* same height as the 16:9 thumbnail (254px wide) so the save row lands on its bottom edge */
+    .umd-right { flex: 1; display: flex; flex-direction: column; min-width: 0; height: calc(254px * 9 / 16); }
+    .umd-label { font-size: 12.5px; font-weight: 600; letter-spacing: .01em; color: var(--text2); margin-bottom: 8px; }
+    .umd-selectwrap { position: relative; margin-bottom: 14px; }
     .umd-selectwrap::after {
-      content: ""; position: absolute; right: 14px; top: 50%; width: 8px; height: 8px;
-      border-right: 2px solid #bcc4d5; border-bottom: 2px solid #bcc4d5;
+      content: ""; position: absolute; right: 16px; top: 50%; width: 7px; height: 7px;
+      border-right: 2px solid var(--text2); border-bottom: 2px solid var(--text2);
       transform: translateY(-70%) rotate(45deg); pointer-events: none;
     }
     select.umd-quality {
-      width: 100%; appearance: none; -webkit-appearance: none;
-      background: rgba(255,255,255,.07); color: #eef1f7; border: 1px solid rgba(255,255,255,.18);
-      border-radius: 10px; padding: 11px 36px 11px 13px; font-size: 14.5px; font-weight: 650; text-shadow: 0 1px 3px rgba(0,0,0,.45);
+      width: 100%; height: 44px; appearance: none; -webkit-appearance: none; color-scheme: dark;
+      background: var(--well); color: var(--text); border: 1px solid var(--edge); box-shadow: var(--well-inset);
+      border-radius: 12px; padding: 0 38px 0 14px; font-size: 14.5px; font-weight: 650;
       cursor: pointer; outline: none; transition: border-color .15s ease, box-shadow .15s ease;
       font-family: inherit;
     }
-    select.umd-quality:hover { border-color: ACCENT88; }
-    select.umd-quality:focus { border-color: ACCENT; box-shadow: 0 0 0 3px ACCENT33; }
+    select.umd-quality option, select.umd-quality optgroup { background: #0b1130; color: #f2f6ff; }
+    select.umd-quality:hover { border-color: rgba(120,190,255,.50); }
+    select.umd-quality:focus { border-color: var(--sky); box-shadow: var(--well-inset), var(--ring); }
     .umd-save {
-      margin-top: 13px; display: flex; align-items: center; gap: 8px;
-      background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.17);
-      border-radius: 10px; padding: 9px 12px;
-      font-size: 13px; color: #d4dbe8; text-shadow: 0 1px 3px rgba(0,0,0,.45), 0 0 8px rgba(0,0,0,.25); min-width: 0;
+      margin-top: auto; display: flex; align-items: center; gap: 9px;
+      background: rgba(4,7,22,.30); border: 1px solid rgba(150,196,255,.14);
+      border-radius: 12px; padding: 10px 13px;
+      font-size: 12.5px; font-weight: 500; color: var(--text2); min-width: 0;
     }
     .umd-save svg { flex: none; }
     .umd-save span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* ---- footer: the action zone, a denser surface under the glass ---- */
     .umd-foot {
-      display: flex; align-items: center; justify-content: space-between; gap: 10px;
-      padding: 14px 18px; border-top: 1px solid rgba(255,255,255,.10);
-      background: linear-gradient(0deg, rgba(255,255,255,.045), rgba(255,255,255,.01));
+      display: flex; align-items: center; justify-content: space-between; gap: 12px; flex: none;
+      padding: 14px 22px 16px;
+      background: linear-gradient(180deg, rgba(4,6,22,0), rgba(4,6,22,.38));
     }
-    .umd-footnote { font-size: 12px; font-weight: 600; color: #d3d9e6; text-shadow: 0 1px 3px rgba(0,0,0,.45), 0 0 8px rgba(0,0,0,.25); }
+    .umd-footnote { font-size: 12.5px; font-weight: 500; color: var(--text3); }
     .umd-actions { display: flex; gap: 10px; }
     .umd-btn {
-      border: 0; border-radius: 10px; cursor: pointer; font-family: inherit;
-      font-size: 14px; font-weight: 700; padding: 10px 20px;
-      transition: transform .12s ease, filter .15s ease, box-shadow .15s ease;
+      height: 40px; border: 0; border-radius: 12px; cursor: pointer; font-family: inherit;
+      font-size: 14px; font-weight: 700; padding: 0 20px; color: var(--text);
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      transition: transform .12s ease, filter .15s ease, box-shadow .15s ease, background .15s ease, border-color .15s ease;
     }
-    .umd-btn:active { transform: scale(.97); }
-    /* keyboard focus: soft accent ring instead of the browser's default
-       black/white outline (we autofocus the primary button on open) */
+    .umd-btn:active { transform: scale(.975); }
+    /* keyboard focus: a sky ring instead of the browser's default outline
+       (the primary button takes focus on open) */
     .umd-btn:focus:not(:focus-visible) { outline: none; }
-    .umd-btn:focus-visible { outline: 2px solid ACCENTcc; outline-offset: 2px; }
-    .umd-ghost { background: rgba(255,255,255,.08); color: #dde3ee; border: 1px solid rgba(255,255,255,.10); }
-    .umd-ghost:hover { background: rgba(255,255,255,.15); color: #fff; }
+    .umd-btn:focus-visible { outline: 2px solid var(--sky); outline-offset: 2px; }
+    .umd-ghost { background: rgba(255,255,255,.07); border: 1px solid var(--edge); color: var(--text); }
+    .umd-ghost:hover { background: rgba(255,255,255,.13); border-color: rgba(170,210,255,.38); }
     .umd-primary {
-      /* liquid-glass primary: translucent accent tint over the glass, bright
-         inset rim on top, soft accent glow - keeps the site color identity
-         without the flat solid fill */
-      background: linear-gradient(180deg, ACCENT66, ACCENT44); color: #fff;
-      border: 1px solid ACCENT55;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,.38), inset 0 -1px 0 rgba(0,0,0,.10), 0 4px 16px ACCENT33;
-      text-shadow: 0 1px 2px rgba(0,0,0,.35);
-      display: inline-flex; align-items: center; gap: 8px;
+      /* the mark's blue-to-violet gradient, kept deep enough for 4.5:1 white
+         text, lit along the top edge like the logo's cyan rim */
+      background: linear-gradient(135deg, #1565e8 0%, #4a52ee 55%, #6d48f0 100%); color: #fff;
+      border: 1px solid rgba(140,205,255,.46);
+      box-shadow: inset 0 1px 0 rgba(160,222,255,.70), inset 0 -1px 0 rgba(10,10,60,.35), 0 6px 20px rgba(60,100,255,.34);
     }
-    .umd-primary:hover { filter: brightness(1.15); box-shadow: inset 0 1px 0 rgba(255,255,255,.45), inset 0 -1px 0 rgba(0,0,0,.10), 0 6px 22px ACCENT55; }
+    .umd-primary:hover { filter: brightness(1.12); box-shadow: inset 0 1px 0 rgba(180,232,255,.85), inset 0 -1px 0 rgba(10,10,60,.35), 0 8px 26px rgba(80,120,255,.46); }
     .umd-primary:disabled { opacity: .45; cursor: default; filter: none; box-shadow: none; }
-    /* loading skeleton */
-    .umd-skel {
-      border-radius: 10px;
-      background: linear-gradient(90deg, #1b1f2b 25%, #232838 45%, #1b1f2b 65%);
-      background-size: 220% 100%; animation: umd-shimmer 1.3s linear infinite;
-    }
-    @keyframes umd-shimmer { 0% { background-position: 130% 0; } 100% { background-position: -90% 0; } }
-    .umd-loading { display: flex; flex-direction: column; align-items: center; gap: 13px; padding: 26px 0 20px; }
+
+    /* ---- loading ---- */
+    .umd-loading { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 28px 0 22px; }
     .umd-spin {
-      width: 34px; height: 34px; border-radius: 50%;
-      border: 3px solid rgba(255,255,255,.12); border-top-color: ACCENT;
-      animation: umd-rot .8s linear infinite;
+      width: 36px; height: 36px; border-radius: 50%;
+      background: conic-gradient(from 0deg, rgba(82,200,255,0) 0%, var(--sky) 55%, var(--violet) 100%);
+      -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3.5px), #000 calc(100% - 3px));
+      mask: radial-gradient(farthest-side, transparent calc(100% - 3.5px), #000 calc(100% - 3px));
+      animation: umd-rot .9s linear infinite;
     }
     @keyframes umd-rot { to { transform: rotate(360deg); } }
-    .umd-loadtext { font-size: 13px; color: #9aa3b2; }
-    /* progress state */
-    .umd-prog { padding: 8px 2px 2px; }
-    .umd-pctrow { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
-    .umd-pct { font-size: 34px; font-weight: 800; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
-    .umd-stage { font-size: 12px; color: #9aa3b2; }
+    .umd-loadtext { font-size: 13.5px; color: var(--text2); text-align: center; }
+
+    /* ---- progress ---- */
+    .umd-prog { padding: 6px 0 2px; }
+    .umd-pctrow { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 14px; }
+    .umd-pct { font-size: 40px; font-weight: 700; letter-spacing: -.03em; line-height: 1; font-variant-numeric: tabular-nums; }
+    .umd-stage { font-size: 13px; color: var(--text2); }
     .umd-bar {
-      height: 12px; border-radius: 999px; overflow: hidden;
-      background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.12);
+      height: 10px; border-radius: 999px; overflow: hidden;
+      background: rgba(4,7,22,.52); border: 1px solid var(--edge); box-shadow: inset 0 1px 2px rgba(0,0,0,.4);
     }
     .umd-fill {
-      height: 100%; width: 0%; border-radius: 999px;
-      background: linear-gradient(90deg, ACCENTBB, ACCENT 55%, ACCENTBB);
-      background-size: 200% 100%;
-      animation: umd-flow 1.4s linear infinite;
+      position: relative; height: 100%; width: 0%; border-radius: 999px;
+      background: linear-gradient(90deg, var(--blue), var(--sky) 52%, #8b6bff);
       transition: width .3s ease;
-      box-shadow: 0 0 14px ACCENT88;
-      position: relative;
+      box-shadow: 0 0 12px rgba(63,160,255,.55);
     }
+    /* one soft glint travelling along the fill says "still working" */
     .umd-fill::after {
-      content: ""; position: absolute; inset: 0;
-      background: repeating-linear-gradient(115deg, rgba(255,255,255,.16) 0 8px, transparent 8px 16px);
-      animation: umd-stripes .7s linear infinite;
+      content: ""; position: absolute; inset: 0; border-radius: inherit;
+      background: linear-gradient(100deg, transparent 30%, rgba(255,255,255,.42) 50%, transparent 70%);
+      background-size: 220% 100%;
+      animation: umd-glint 1.7s linear infinite;
     }
-    @keyframes umd-flow { 0% { background-position: 0% 0; } 100% { background-position: -200% 0; } }
-    @keyframes umd-stripes { 0% { transform: translateX(0); } 100% { transform: translateX(22.6px); } }
-    .umd-stats { display: flex; gap: 18px; margin-top: 13px; }
-    .umd-stat { flex: 1; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.11); border-radius: 10px; padding: 9px 12px; }
-    .umd-stat .k { font-size: 10.5px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: #6f7789; }
-    .umd-stat .v { font-size: 14px; font-weight: 700; color: #eef1f7; margin-top: 2px; font-variant-numeric: tabular-nums; }
-    /* done state */
-    .umd-done { display: flex; flex-direction: column; align-items: center; padding: 22px 0 14px; }
-    .umd-checkwrap { position: relative; width: 86px; height: 86px; margin-bottom: 14px; }
+    @keyframes umd-glint { 0% { background-position: 120% 0; } 100% { background-position: -120% 0; } }
+    .umd-stats { display: flex; gap: 10px; margin-top: 16px; }
+    .umd-stat { flex: 1; min-width: 0; background: var(--well); border: 1px solid rgba(150,196,255,.14); box-shadow: var(--well-inset); border-radius: 12px; padding: 10px 13px; }
+    .umd-stat .k { font-size: 12px; font-weight: 600; color: var(--text3); }
+    .umd-stat .v { font-size: 14px; font-weight: 650; color: var(--text); margin-top: 3px; font-variant-numeric: tabular-nums; }
+
+    /* ---- done ---- */
+    .umd-done { display: flex; flex-direction: column; align-items: center; padding: 22px 0 12px; }
+    .umd-checkwrap { position: relative; width: 86px; height: 86px; margin-bottom: 16px; }
     .umd-checkring {
       position: absolute; inset: 0; border-radius: 50%;
-      background: ACCENT22; border: 1.5px solid ACCENT66;
+      background: radial-gradient(circle at 35% 25%, rgba(82,200,255,.26), rgba(122,92,255,.12) 75%);
+      border: 1.5px solid rgba(120,205,255,.60);
+      box-shadow: 0 0 24px rgba(60,150,255,.30);
       animation: umd-pop .45s cubic-bezier(.2,1.4,.4,1) both;
     }
     .umd-checkring svg { position: absolute; inset: 0; margin: auto; }
@@ -766,24 +929,42 @@
     @keyframes umd-draw { to { stroke-dashoffset: 0; } }
     .umd-sitelogo {
       position: absolute; right: -7px; bottom: -7px; width: 34px; height: 34px;
-      border-radius: 10px; background: rgba(22,26,36,.9); border: 1px solid rgba(255,255,255,.22);
+      border-radius: 11px; background: rgba(8,12,34,.92); border: 1px solid rgba(170,210,255,.30);
       display: flex; align-items: center; justify-content: center; overflow: hidden;
       animation: umd-pop .5s .3s cubic-bezier(.2,1.6,.4,1) both;
       box-shadow: 0 4px 14px rgba(0,0,0,.5);
     }
     .umd-sitelogo img { width: 22px; height: 22px; border-radius: 5px; }
     @keyframes umd-pop { 0% { transform: scale(.3); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
-    .umd-donetitle { font-size: 19px; font-weight: 700; letter-spacing: -.01em; }
-    .umd-donefile { margin-top: 5px; font-size: 12.5px; color: #9aa3b2; max-width: 480px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    /* error state */
-    .umd-err { padding: 18px 2px 6px; }
+    .umd-donetitle { font-size: 20px; font-weight: 650; letter-spacing: -.01em; }
+    .umd-donefile { margin-top: 6px; font-size: 13px; color: var(--text2); max-width: 480px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* ---- error ---- */
+    .umd-err { padding: 14px 0 4px; }
     .umd-errbox {
-      background: rgba(255, 82, 82, .08); border: 1px solid rgba(255, 82, 82, .25);
-      border-radius: 12px; padding: 13px 15px; font-size: 13px; line-height: 1.5; color: #ffb4ab;
+      display: flex; gap: 12px; align-items: flex-start;
+      background: rgba(255,92,116,.10); border: 1px solid rgba(255,125,142,.38);
+      border-radius: 14px; padding: 14px 16px; font-size: 13.5px; line-height: 1.5; color: #ffd3d9;
+    }
+    .umd-errbox svg { flex: none; margin-top: 1px; color: #ff8d9b; }
+
+    /* ---- narrow viewports: stack the media above its choices ---- */
+    @media (max-width: 620px) {
+      .umd-main { flex-direction: column; gap: 16px; }
+      .umd-left { width: 100%; }
+      .umd-right { height: auto; }
+      .umd-save { margin-top: 0; }
+      .umd-selectwrap { margin-bottom: 12px; }
+      .umd-stats { flex-wrap: wrap; }
+      .umd-stat { flex: 1 1 40%; }
+      .umd-foot { flex-wrap: wrap; }
+      .umd-head, .umd-body, .umd-foot { padding-left: 18px; padding-right: 18px; }
+      .umd-pasterow { padding-left: 18px; padding-right: 18px; }
     }
     @media (prefers-reduced-motion: reduce) {
-      .umd-fill, .umd-fill::after, .umd-spin, .umd-skel { animation: none !important; }
-      .umd-backdrop, .umd-card, .umd-fill { transition: none !important; }
+      .umd-fill::after, .umd-spin, .umd-cardsheen::before { animation: none !important; }
+      .umd-cardsheen::before { display: none; }
+      .umd-backdrop, .umd-card, .umd-fill, .umd-x svg { transition: none !important; }
     }
   `;
 
@@ -809,8 +990,186 @@
   }
 
   let overlay = null; // { host, root, close() }
+  // Probe sequencing: a newer probe supersedes an in-flight one, so a
+  // pasted link never waits for the page probe and the page probe's late
+  // result can never overwrite the link the user actually picked.
+  let probeSeq = 0;
 
-  function openOverlay() {
+  // The media identity of a URL: origin + path + YouTube's ?v=, so tracking
+  // or progress params neither bust the probe cache nor fool the nav watch.
+  function mediaKey(u) {
+    try {
+      const x = new URL(u);
+      let k = x.origin + x.pathname;
+      const v = x.searchParams.get("v");
+      if (v) k += "?v=" + v; // YouTube identifies videos by ?v=
+      return k;
+    } catch (e) { return u; }
+  }
+  // Does this page's own URL name a single media item? On these pages the
+  // URL bar is the primary probe target (yt-dlp reads them natively); on
+  // feeds and home pages it is not, and player-targeting stays the fallback.
+  function isMediaPage(u) {
+    try {
+      const x = new URL(u), h = x.hostname.replace(/^www\./, ""), p = x.pathname;
+      if (/(^|\.)youtube\.com$/.test(h)) return p.startsWith("/watch") || p.startsWith("/shorts/");
+      if (/(^|\.)instagram\.com$/.test(h)) return /^\/(p|reel|reels)\//.test(p);
+      if (/(^|\.)reddit\.com$/.test(h)) return p.includes("/comments/");
+      if (/(^|\.)twitch\.tv$/.test(h)) {
+        if (h.startsWith("clips.") || /^\/videos\/\d/.test(p)) return true;
+        // A bare channel page is a live stream, which the URL also names.
+        const seg = p.replace(/^\/+|\/+$/g, "");
+        if (seg && !seg.includes("/")) {
+          return ["directory","settings","jobs","store","prime","turbo","drops",
+                  "wallet","subscriptions","inventory","messaging","search",
+                  "browse","p","video","videos","clip","clips"].indexOf(seg) < 0;
+        }
+        return false;
+      }
+      if (/(^|\.)soundcloud\.com$/.test(h)) return /^\/[^/]+\/[^/]+/.test(p);
+      if (/(^|\.)streamable\.com$/.test(h)) return /^\/[^/]{3,}\/?$/.test(p);
+      if (/(^|\.)ted\.com$/.test(h)) return p.startsWith("/talks/");
+      return true; // any other supported host: let the URL try first
+    } catch (e) { return true; }
+  }
+  // Probe results live until the tab moves to a different video. Reopening
+  // the pill on the same page reads this instead of re-probing, and the
+  // prefetch below lands here too, so the first click is usually instant.
+  const probeCache = new Map(); // mediaKey -> { url, info, options }
+  let inflightProbe = null; // { key, promise } - a prefetch still in flight
+  function cacheProbe(url, r) {
+    if (!r || !r.ok || !(r.options || []).length) return;
+    probeCache.set(mediaKey(url), { url, info: r.info || {}, options: r.options || [] });
+    // Entries for pages already left can never be served (lookups are keyed
+    // by the page being probed); drop them so the cache stays one-video deep.
+    const keep = mediaKey(location.href);
+    const tk = targetOverride && targetOverride.url ? mediaKey(targetOverride.url) : null;
+    for (const k of probeCache.keys()) if (k !== keep && k !== tk) probeCache.delete(k);
+  }
+
+  // Prefetch: the first hover on the pill - and, on media pages, shortly
+  // after the pill appears - starts reading the current target in the
+  // background, so the menu usually opens with options already in cache.
+  // Failures are silent here - the menu's own probe reports errors when it runs.
+  let pageProbeSent = false;
+  function prefetchProbe() {
+    if (pageProbeSent) return;
+    if (targetOverride && targetOverride.unresolved) return; // nothing to warm
+    const url = (targetOverride && targetOverride.url) || location.href;
+    if (probeCache.has(mediaKey(url))) return; // already warm
+    if (inflightProbe && inflightProbe.key === mediaKey(url)) return; // probing now
+    pageProbeSent = true;
+    inflightProbe = { key: mediaKey(url), promise: send("probe", { url }, 60000)
+      .then((r) => { if (r && r.ok) cacheProbe(url, r); return r; })
+      .catch(() => { pageProbeSent = false; return null; }) }; // retry later
+  }
+
+  // Player targeting: dropping the floating pill over a player targets THAT
+  // media instead of the page URL (feeds and players that never change the
+  // address bar). Dragging it back off the player clears the target. A drop
+  // on a player with no resolvable link marks the target UNRESOLVED: the menu
+  // then says so instead of silently probing the page (which on a feed could
+  // pick a different video).
+  let targetOverride = null; // { url, anchor } | { unresolved: true } | null
+  function umdResolvePlayerTarget(el) {
+    let node = el, video = null, iframe = null, hop = 0;
+    let permalink = null, hopsPastVideo = 0;
+    while (node && node !== document.body && hop++ < 14) {
+      const tag = node.tagName || "";
+      if (!iframe && tag === "IFRAME") iframe = node;
+      if (!video && tag === "VIDEO") video = node;
+      else if (video) hopsPastVideo++;
+      // Reddit's web components carry the canonical link on the post node.
+      if (!permalink && node.getAttribute) {
+        const pl = node.getAttribute("permalink");
+        if (pl && typeof pl === "string") {
+          try { permalink = new URL(pl, location.href).href; } catch (e) {}
+        }
+      }
+      if (node.querySelector) {
+        if (!video) video = node.querySelector("video");
+        // Generic fallback: a post wrapper usually links to its own page.
+        // Only near the player - higher up a feed, the first /comments/ link
+        // could belong to a different post.
+        if (!permalink && hopsPastVideo <= 2) {
+          const a = node.querySelector('a[href*="/comments/"]');
+          if (a && a.href) permalink = a.href;
+        }
+      }
+      // Keep climbing after the video turns up: the canonical post link often
+      // lives on a wrapper ABOVE the player (e.g. the post container).
+      node = node.parentElement ||
+             (node.getRootNode && node.getRootNode().host) || null;
+    }
+    // An embedded cross-origin player (YouTube-in-Reddit etc.) cannot be
+    // inspected, but its frame src IS readable and usually names the media.
+    if (iframe) {
+      try {
+        const s = new URL(iframe.src, location.href);
+        if (s.protocol === "http:" || s.protocol === "https:") {
+          return { url: s.href, anchor: iframe };
+        }
+      } catch (e) {}
+    }
+    if (permalink) return { url: permalink, anchor: video || el };
+    if (video) {
+      const src = video.currentSrc || video.src || "";
+      if (/^https?:/i.test(src)) return { url: src, anchor: video };
+      return { unresolved: true, anchor: video }; // blob:/MSE-only player
+    }
+    return null; // no player under the button at all
+  }
+  function umdMarkTarget(b, anchor, flash, unresolved) {
+    b.classList.toggle("umd-targeting", !!anchor);
+    b.title = !anchor ? "" : (unresolved
+      ? "That player has no downloadable link - open the video's own page"
+      : "Targets the video under this button");
+    if (!anchor || !flash) return;
+    const r = anchor.getBoundingClientRect();
+    if (r.width < 24 || r.height < 24) return;
+    const box = document.createElement("div");
+    box.style.cssText = "position:fixed;z-index:2147483646;pointer-events:none;" +
+      "border:2px solid #7ec8ff;border-radius:10px;" +
+      "box-shadow:0 0 18px rgba(126,200,255,.45);" +
+      "left:" + (r.left - 4) + "px;top:" + (r.top - 4) + "px;" +
+      "width:" + (r.width + 8) + "px;height:" + (r.height + 8) + "px;" +
+      "opacity:1;transition:opacity .5s ease";
+    document.body.appendChild(box);
+    setTimeout(() => { box.style.opacity = "0"; }, 900);
+    setTimeout(() => { box.remove(); }, 1500);
+  }
+  function umdUpdateTarget(b) {
+    const r = b.getBoundingClientRect();
+    const prev = b.style.pointerEvents;
+    b.style.pointerEvents = "none";
+    const el = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    b.style.pointerEvents = prev;
+    const t = el && umdResolvePlayerTarget(el);
+    if (t && t.url) {
+      const isNew = !targetOverride || targetOverride.url !== t.url;
+      targetOverride = t;
+      umdMarkTarget(b, t.anchor, isNew);
+      if (isNew) { pageProbeSent = false; prefetchProbe(); } // warm this target now
+    } else if (t) {
+      // A player was found but exposes no link (blob:/MSE-only). On a media
+      // page the URL bar still names the video and page probing is primary,
+      // so the player must not block it; elsewhere remember the dead end.
+      if (isMediaPage(location.href)) {
+        targetOverride = null;
+        umdMarkTarget(b, null, false);
+      } else {
+        targetOverride = { unresolved: true };
+        umdMarkTarget(b, t.anchor, true, true);
+      }
+    } else {
+      targetOverride = null;
+      umdMarkTarget(b, null, false);
+    }
+  }
+
+  // menuMode: opened from the toolbar button - the same liquid-glass card,
+  // plus the paste-a-link row the browser popup used to carry.
+  function openOverlay(menuMode) {
     if (overlay) { overlay.close(); overlay = null; }
     const oh = document.createElement("div");
     const shadow = oh.attachShadow({ mode: "open" });
@@ -840,7 +1199,7 @@
     const docGlass = document.createElement("div");
     docGlass.setAttribute("aria-hidden", "true");
     docGlass.style.cssText = "position:fixed;z-index:2147483646;pointer-events:none;" +
-      "background:linear-gradient(180deg, rgba(14,20,42,.08), rgba(11,16,36,.34));opacity:0;transform:scale(.96) translateY(8px);" +
+      "background:linear-gradient(180deg, rgba(10,18,48,.16), rgba(8,12,36,.30));opacity:0;transform:scale(.96) translateY(8px);" +
       "transition:opacity .22s ease, transform .24s cubic-bezier(.2,.9,.25,1.1);";
     const card = el("div", "umd-card");
     card.setAttribute("role", "dialog");
@@ -850,10 +1209,11 @@
     // SVG outline of the exact card polygon, rebuilt whenever the size changes.
     const cardTint = el("i", "umd-cardlayer umd-cardtint");
     const cardCap = el("i", "umd-cardlayer umd-cardcap");
+    const cardSheen = el("i", "umd-cardlayer umd-cardsheen");
     const cardRim = el("i", "umd-cardrim");
-    for (const l of [cardTint, cardCap, cardRim]) l.setAttribute("aria-hidden", "true");
+    for (const l of [cardTint, cardCap, cardSheen, cardRim]) l.setAttribute("aria-hidden", "true");
     const content = el("div", "umd-content");
-    card.append(cardTint, cardCap, cardRim, content);
+    card.append(cardTint, cardCap, cardSheen, cardRim, content);
     wrap.append(cardShadow, card);
     backdrop.appendChild(wrap);
     shadow.appendChild(backdrop);
@@ -906,9 +1266,11 @@
       phase: "loading", // loading | ready | downloading | done | error | setup
       info: null, options: [], job: null, downloadDir: "~/Downloads/UMD",
       url: null, // the exact page URL the visible options were probed from
+      urlIsPage: true, // false when the options came from a pasted link
     };
 
     function close() {
+      probeSeq++; // invalidate any in-flight probe continuation
       backdrop.classList.remove("umd-in");
       docGlass.style.opacity = "0";
       setTimeout(() => { oh.remove(); docGlass.remove(); }, 240);
@@ -924,7 +1286,7 @@
     function onKey(e) {
       if (e.key === "Escape") { e.stopPropagation(); if (st.phase === "downloading") cancelJob(); else close(); }
       if (e.key === "Tab") {
-        const f = card.querySelectorAll('button, select, [tabindex]:not([tabindex="-1"])');
+        const f = card.querySelectorAll('button, select, input, [tabindex]:not([tabindex="-1"])');
         if (!f.length) return;
         const first = f[0], last = f[f.length - 1];
         const active = shadow.activeElement;
@@ -936,18 +1298,11 @@
     // If the single-page app navigates to a DIFFERENT media page while the
     // panel is open, the shown options would no longer match - close instead
     // of mixing them. Players also rewrite the URL on their own (tracking or
-    // progress params), so compare the media identity, not the raw href.
-    const mediaKey = (u) => {
-      try {
-        const x = new URL(u);
-        let k = x.origin + x.pathname;
-        const v = x.searchParams.get("v");
-        if (v) k += "?v=" + v; // YouTube identifies videos by ?v=
-        return k;
-      } catch (e) { return u; }
-    };
+    // progress params), so compare the media identity (mediaKey), not href.
+    // Only a probe of THIS page goes stale when the page navigates; pasted
+    // links keep their options regardless of where this tab goes.
     const navWatch = setInterval(() => {
-      if (st.url && mediaKey(location.href) !== mediaKey(st.url)) close();
+      if (st.url && st.urlIsPage && mediaKey(location.href) !== mediaKey(st.url)) close();
     }, 800);
     backdrop.addEventListener("mousedown", (e) => {
       if (e.target === backdrop && st.phase !== "downloading" && st.phase !== "loading") close();
@@ -965,15 +1320,52 @@
     brand.append(bimg, el("span", "umd-brandname", "AMD"));
     card.appendChild(brand);
     const ht = el("span", "umd-headtitle", "Download media");
-    const x = el("button", "umd-x", "\u00d7");
+    const x = el("button", "umd-x");
+    x.type = "button";
+    x.innerHTML = '<svg viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M1.5 1.5l7 7m0-7l-7 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>';
     x.setAttribute("aria-label", "Close");
     x.onclick = () => { if (st.phase === "downloading") cancelJob(); else close(); };
-    card.appendChild(x); // Mac-style close caps the right end of the raised tab
+    card.appendChild(x); // the close button caps the right end of the raised tab
     head.append(ht);
 
     const body = el("div", "umd-body");
     const foot = el("div", "umd-foot");
     content.append(head, body, foot);
+
+    // Menu mode only: paste any video/audio link and probe it, the same job
+    // the browser popup's link field did. The page probe still starts on its
+    // own below, exactly like the Download button.
+    let pasteInput = null, pasteBtn = null;
+    if (menuMode) {
+      const prow = el("div", "umd-pasterow");
+      pasteInput = el("input", "umd-pasteinput");
+      pasteInput.type = "url";
+      pasteInput.placeholder = "Paste a video or audio link";
+      pasteInput.setAttribute("aria-label", "Paste a video or audio link");
+      pasteInput.spellcheck = false;
+      pasteInput.autocomplete = "off";
+      pasteBtn = el("button", "umd-btn umd-primary umd-pastebtn", "Check");
+      const go = () => { const u = (pasteInput.value || "").trim(); if (u) probeUrl(u, false); };
+      pasteBtn.onclick = go;
+      pasteInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.stopPropagation(); go(); } });
+      prow.append(pasteInput, pasteBtn);
+      content.insertBefore(prow, body);
+    }
+    function setPasteEnabled(on) {
+      if (!pasteInput) return;
+      pasteInput.disabled = !on;
+      pasteBtn.disabled = !on;
+    }
+
+    // Error text always travels with an icon, so it never relies on colour alone.
+    function errBox(msg) {
+      const b = el("div", "umd-errbox");
+      b.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
+        '<path d="M12 3.5l9.5 16.5h-19L12 3.5z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>' +
+        '<path d="M12 10v4.2M12 17.2v.1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+      b.appendChild(el("span", "", msg));
+      return b;
+    }
 
     // ---- footer (rebuilt per phase)
     function renderFoot(note, actions) {
@@ -998,20 +1390,24 @@
     }
 
     // ---- phases
-    function showLoading() {
+    function showLoading(forPage) {
       st.phase = "loading";
+      // Paste stays enabled: checking a link must not wait on an unrelated
+      // page probe (probeUrl sequencing keeps their results straight).
       body.innerHTML = "";
       const w = el("div", "umd-loading");
-      w.append(el("div", "umd-spin"), el("div", "umd-loadtext", "Reading this page\u2026"));
+      w.append(el("div", "umd-spin"), el("div", "umd-loadtext",
+        forPage === false ? "Reading that link\u2026" : "Reading this page\u2026"));
       body.appendChild(w);
       renderFoot("Checking what the local engine can fetch", []);
     }
 
     function showSetupError(msg) {
       st.phase = "setup";
+      setPasteEnabled(true);
       body.innerHTML = "";
       const w = el("div", "umd-err");
-      w.appendChild(el("div", "umd-errbox",
+      w.appendChild(errBox(
         "The local helper is not answering (" + msg + "). Run the installer for your system, restart your browser, then click the Download button again."));
       body.appendChild(w);
       renderFoot("", [ghostBtn("Close", close)]);
@@ -1019,15 +1415,17 @@
 
     function showError(msg) {
       st.phase = "error";
+      setPasteEnabled(true);
       body.innerHTML = "";
       const w = el("div", "umd-err");
-      w.appendChild(el("div", "umd-errbox", msg || "Something went wrong."));
+      w.appendChild(errBox(msg || "Something went wrong."));
       body.appendChild(w);
       renderFoot("", [ghostBtn("Close", close), primaryBtn("Try again", boot)]);
     }
 
     function showReady() {
       st.phase = "ready";
+      setPasteEnabled(true);
       body.innerHTML = "";
       const main = el("div", "umd-main");
 
@@ -1070,7 +1468,7 @@
 
       const save = el("div", "umd-save");
       save.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
-        '<path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="#bcc4d5" stroke-width="1.7" stroke-linejoin="round"/></svg>';
+        '<path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="#8fb8ff" stroke-width="1.7" stroke-linejoin="round"/></svg>';
       save.appendChild(el("span", "", "Saves to " + st.downloadDir));
       right.appendChild(save);
 
@@ -1088,6 +1486,7 @@
 
     function showProgress() {
       st.phase = "downloading";
+      setPasteEnabled(false);
       body.innerHTML = "";
       const w = el("div", "umd-prog");
       const row = el("div", "umd-pctrow");
@@ -1112,13 +1511,14 @@
 
     function showDone(file) {
       st.phase = "done";
+      setPasteEnabled(true);
       body.innerHTML = "";
       const w = el("div", "umd-done");
       const cw = el("div", "umd-checkwrap");
       const ring = el("div", "umd-checkring");
       ring.innerHTML =
         '<svg width="40" height="40" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
-        '<path d="M4.5 12.5l5 5 10-11" stroke="' + site.accent + '" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+        '<path d="M4.5 12.5l5 5 10-11" stroke="#8fe0ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
       const lg = el("div", "umd-sitelogo");
       const li = document.createElement("img");
       li.src = faviconUrl(); li.alt = site.name; li.onerror = () => li.remove();
@@ -1170,39 +1570,112 @@
       }
     });
 
+    // One probe path for the page itself and for pasted links; isPage marks
+    // whether SPA navigation should retire the shown options (navWatch).
+    async function probeUrl(url, isPage) {
+      const my = ++probeSeq;
+      showLoading(isPage);
+      // A prefetch for this exact target may already be in flight: consume
+      // it instead of starting a second probe over the first. A failed
+      // prefetch falls through to a fresh probe below.
+      let r = null;
+      if (inflightProbe && inflightProbe.key === mediaKey(url)) {
+        r = await inflightProbe.promise;
+        inflightProbe = null;
+      }
+      if (my !== probeSeq) return; // superseded by a newer probe
+      if (!r) {
+        const p = send("probe", { url }, 13000, () => {
+          if (my !== probeSeq) return; // a newer probe owns the card now
+          const lt = shadow.querySelector(".umd-loadtext");
+          if (lt) lt.textContent = isPage
+            ? "Still reading this page - this can take up to 45 seconds."
+            : "Still reading that link - this can take up to 45 seconds.";
+        });
+        inflightProbe = { key: mediaKey(url), promise: p };
+        r = await p;
+        if (inflightProbe && inflightProbe.promise === p) inflightProbe = null;
+      }
+      if (my !== probeSeq) return; // superseded by a newer probe
+      if (st.phase !== "loading") return; // closed or moved on
+      if (!r.ok) {
+        showError(r.error || "Could not read that link.");
+        return;
+      }
+      st.url = url;
+      st.urlIsPage = !!isPage;
+      st.info = r.info || {};
+      st.options = r.options || [];
+      if (!st.options.length) {
+        showError(isPage
+          ? "The downloader found no downloadable formats on this page."
+          : "The downloader found no downloadable formats at that link.");
+        return;
+      }
+      cacheProbe(url, r);
+      showReady();
+    }
+
     async function boot() {
-      showLoading();
+      // Page URL is the primary probe target. A player drop wins only when
+      // it resolved to a real link for a DIFFERENT media item than the page;
+      // an unreadable player (blob:/MSE-only) never blocks a media page.
+      const t = targetOverride;
+      let url = location.href, isPage = true;
+      if (t && t.url && mediaKey(t.url) !== mediaKey(location.href)) {
+        url = t.url; isPage = false;
+      } else if (t && t.unresolved && !isMediaPage(location.href)) {
+        showLoading(true);
+        showError("That player doesn't expose a downloadable link. Open the video's own page and try there.");
+        return;
+      }
+      showLoading(true);
       const stt = await new Promise((res) =>
         chrome.runtime.sendMessage({ to: "bridge", cmd: "bridge-state" }, res));
       if (!stt || !stt.connected) {
         showSetupError((stt && stt.error) || "not connected");
         return;
       }
-      const ping = await send("ping", null, 10000);
+      const hit = probeCache.get(mediaKey(url));
+      if (hit) {
+        // Instant path: this page was already probed (prefetch or an earlier
+        // open) and the tab has not moved to another video since.
+        st.url = hit.url; st.urlIsPage = isPage;
+        st.info = hit.info; st.options = hit.options;
+        showReady();
+        // Still confirm the helper in the background so a dead bridge and
+        // the download dir surface correctly instead of failing at click.
+        send("ping", null, 10000).then((ping) => {
+          if (st.phase !== "ready" && st.phase !== "downloading") return;
+          if (!ping.ok) { showSetupError(ping.error || "no answer"); return; }
+          if (ping.download_dir) st.downloadDir = ping.download_dir;
+        });
+        return;
+      }
+      // Ping runs in parallel with the probe; it used to add a full round
+      // trip before the probe even started.
+      const pingP = send("ping", null, 10000);
+      probeUrl(url, isPage);
+      const ping = await pingP;
       if (!ping.ok) { showSetupError(ping.error || "no answer"); return; }
       if (ping.download_dir) st.downloadDir = ping.download_dir;
-      const pageUrl = location.href;
-      const r = await send("probe", { url: pageUrl }, 13000);
-      if (!r.ok) { showError(r.error || "Could not read that link."); return; }
-      st.url = pageUrl;
-      st.info = r.info || {};
-      st.options = r.options || [];
-      if (!st.options.length) { showError("The downloader found no downloadable formats on this page."); return; }
-      showReady();
     }
 
     boot();
     requestAnimationFrame(() => {
       backdrop.classList.add("umd-in");
-      docGlass.style.opacity = "1";
-      docGlass.style.transform = "scale(1) translateY(0)";
     });
+    // docGlass stays hidden through the entrance: a bake taken mid-animation
+    // (scale .96 / translateY 8px) leaves the blur offset from the card for
+    // the rest of the phase. It appears only after the settle rebake below.
     // After the entrance animation, drop the wrap's identity transform: any
     // non-"none" transform on a glass ancestor makes it a backdrop root and
     // the card's refraction/frost layers would sample an empty backdrop.
     const settleGlass = () => {
       wrap.style.transition = "none"; wrap.style.transform = "none";
       docGlass.style.transition = "none"; docGlass.style.transform = "none";
+      applyCardGlass(); // rect changed by the settle: rebake clip + glass geometry
+      docGlass.style.opacity = "1";
     };
     wrap.addEventListener("transitionend", settleGlass, { once: true });
     setTimeout(settleGlass, 500); // safety if transitionend is missed

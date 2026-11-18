@@ -10,13 +10,14 @@
   <i class="layer cap" aria-hidden="true"></i>
   <div id="glassrim" aria-hidden="true"></div>
 
-  <div class="brand"><span class="brandname">AMD</span><span class="brandver" id="extver"></span></div>
-  <button id="closex" aria-label="Close">&times;</button>
+  <div class="tabzone">
+    <span id="conn" class="pill"><i></i>Checking helper&#8230;</span>
+    <button id="closex" aria-label="Close"><svg viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M1.5 1.5l7 7m0-7l-7 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></button>
+  </div>
 
   <div class="content">
     <header>
       <span class="headleft"><img class="headart" src="icons/tab-mark.png" alt=""><span class="headtitle">ARYZEN Media Downloader</span></span>
-      <span id="conn" class="pill"><i></i>checking...</span>
     </header>
 
     <section id="setup" hidden>
@@ -28,22 +29,34 @@
         <li>Restart your browser, then reopen this popup.</li>
       </ol>
       <p class="dim" id="setup-err"></p>
+      <p class="dim">Run the installer again, then restart your browser.</p>
     </section>
 
     <section id="main" hidden>
-      <button id="usetab" class="primary big hero">&#11015; Download from this tab</button>
+      <button id="usetab" class="primary hero"><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.5v8m0 0l-3.2-3.2M8 10.5l3.2-3.2M3 13.5h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> Download from this tab</button>
+      <div class="tabhint" id="tabhint" hidden></div>
 
-      <div class="or"><span>or paste a link</span></div>
-      <div class="urlrow">
+      <div class="or"><span>Or paste a link</span></div>
+      <label class="sr-only" for="url">Video or audio link</label>
+      <div class="urlgroup">
         <input id="url" type="url" placeholder="Paste a video or audio link" spellcheck="false" autocomplete="off">
-        <button id="check" class="primary">Check</button>
+        <button id="check" class="secondary">Check link</button>
+      </div>
+      <div class="saveto"><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 5.2c0-.7.5-1.2 1.2-1.2h3l1.4 1.6h5.2c.7 0 1.2.5 1.2 1.2v4.4c0 .7-.5 1.2-1.2 1.2H3.2c-.7 0-1.2-.5-1.2-1.2V5.2z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg><span class="savetxt">Saves to <b id="saveto" title="~/Downloads/UMD">~/Downloads/UMD</b></span><button id="openfolder2" class="link">Open</button></div>
+
+      <div id="status" class="status" role="status" aria-live="polite" hidden></div>
+
+      <div id="probe-skel" class="skel" aria-hidden="true" hidden>
+        <div class="skel-thumb"></div>
+        <div class="skel-lines"><div class="skel-bar w80"></div><div class="skel-bar w55"></div></div>
       </div>
 
-      <div id="status" class="status" hidden></div>
-
       <div id="info" class="info" hidden>
-        <img id="thumb" alt="" hidden>
-        <div>
+        <div class="thumbwrap">
+          <img id="thumb" alt="" hidden>
+          <span id="durbadge" class="durbadge" hidden></span>
+        </div>
+        <div class="infotext">
           <div id="title" class="title"></div>
           <div id="meta" class="dim"></div>
         </div>
@@ -51,31 +64,36 @@
 
       <div id="options"></div>
 
-      <button id="download" class="primary big" hidden>Download</button>
+      <div class="actionbar" id="actionbar" hidden>
+        <button id="download" class="primary big" disabled><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.5v8m0 0l-3.2-3.2M8 10.5l3.2-3.2M3 13.5h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> <span id="downtext">Choose a format</span></button>
+      </div>
 
       <div id="progress" hidden>
-        <div class="phead"><span id="ptitle" class="ptitle">Downloading</span><span id="ppct"></span></div>
-        <div class="bar"><div id="fill"></div></div>
-        <div id="ptext" class="dim"></div>
-        <button id="cancel" class="link">Cancel</button>
+        <div class="pctrow"><span id="ppct"></span><span id="pstage" class="dim">Downloading&#8230;</span></div>
+        <div class="bar"><div id="fill" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div>
+        <div class="pstats"><span id="pspeed">&mdash;</span><span class="pdot" aria-hidden="true">&middot;</span><span id="peta">&mdash;</span><span id="pdest" class="sr-only">~/Downloads/UMD</span></div>
+        <span id="pannounce" class="sr-only" aria-live="polite"></span>
+        <button id="cancel" class="ghost">Cancel download</button>
       </div>
 
       <div id="done" hidden>
-        <div id="donetext"></div>
-        <div class="row">
-          <button id="openfolder">Open folder</button>
-          <button id="again" class="link">New download</button>
+        <div class="donehead">
+          <svg class="donecheck" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.6"/><path class="tick" d="M7.5 12.5l3 3 6-6.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <div class="donetexts">
+            <div id="donetext" class="donetitle"></div>
+            <div id="donedir" class="dim"></div>
+          </div>
         </div>
-      </div>
-
-      <div class="quick">
-        <button id="openfolder2" class="link">Open downloads folder</button>
+        <div class="row">
+          <button id="openfolder" class="primary">Open folder</button>
+          <button id="again" class="secondary">New download</button>
+        </div>
       </div>
     </section>
 
     <footer>
-      <span id="eng">engine: ...</span>
-      <a href="#" id="update">update engine</a>
+      <span class="footleft"><span id="extver"></span><span class="footsep" aria-hidden="true">&middot;</span><span id="eng">yt-dlp &#8230;</span></span>
+      <button id="update" class="link">Update engine</button>
     </footer>
   </div>
 </div>

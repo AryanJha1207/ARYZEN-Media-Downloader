@@ -1,22 +1,23 @@
 {
   "manifest_version": 3,
   "name": "ARYZEN Media Downloader",
-  "version": "2.0.0",
+  "version": "2.2.4",
   "description": "Save video and audio from pages you browse, at the qualities the site actually offers. Runs fully on your own computer with a local yt-dlp engine.",
   "permissions": [
     "activeTab",
+    "scripting",
     "storage",
     "nativeMessaging"
   ],
   "action": {
-    "default_popup": "popup.html",
     "default_title": "ARYZEN Media Downloader",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
-    }
+    },
+    "default_popup": "popup.html"
   },
   "background": {
     "service_worker": "background.js"

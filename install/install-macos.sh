@@ -67,7 +67,7 @@ banner() {
 # animation the author linked (lottiefiles.com/free-animation/loading-99FrBcVjYZ);
 # no Lottie asset, code or license material is used - the spinner is a plain
 # terminal convention drawn from scratch in the AMD gradient colors.
-STAGE_TOTAL=7
+STAGE_TOTAL=8
 STEPN=0
 HIST=0
 SAVE="$ESC"7
@@ -182,6 +182,33 @@ stage_ytdlp() {
   echo "yt-dlp $TAG downloaded and SHA-256 verified"
 }
 
+stage_deno() {
+  if [ "$ARCH" = "arm64" ]; then DZIP="deno-aarch64-apple-darwin.zip"; else DZIP="deno-x86_64-apple-darwin.zip"; fi
+  if ! curl -fsSL -o "$TMPF/deno.zip" "https://github.com/denoland/deno/releases/download/$DENO_TAG/$DZIP"; then
+    echo "Deno runtime download failed - check your internet connection."
+    return 1
+  fi
+  WANTD=$(curl -fsSL "https://github.com/denoland/deno/releases/download/$DENO_TAG/$DZIP.sha256sum" | grep -Eo '[0-9a-fA-F]{64}' | head -1 | tr 'A-F' 'a-f') || true
+  if [ -z "$WANTD" ]; then
+    echo "could not read the official Deno checksum."
+    return 1
+  fi
+  check_sha "$TMPF/deno.zip" "$WANTD" "Deno runtime" || return 1
+  ditto -x -k "$TMPF/deno.zip" "$TMPF/deno" 2>/dev/null || unzip -o "$TMPF/deno.zip" -d "$TMPF/deno" >/dev/null
+  DENOBIN="$(find "$TMPF/deno" -name deno -type f | head -1)"
+  if [ -z "$DENOBIN" ]; then
+    echo "downloaded Deno archive did not contain the expected binary - nothing was installed."
+    return 1
+  fi
+  cp "$DENOBIN" "$TMPF/deno.bin"
+  # Deno is MIT-licensed; the license text must accompany the binary.
+  if ! curl -fsSL -o "$TMPF/deno.LICENSE.txt" "https://raw.githubusercontent.com/denoland/deno/$DENO_TAG/LICENSE.md" || ! grep -q 'MIT License' "$TMPF/deno.LICENSE.txt"; then
+    echo "could not fetch the Deno license text - nothing was installed."
+    return 1
+  fi
+  echo "Deno $DENO_TAG runtime downloaded and SHA-256 verified"
+}
+
 stage_ffmpeg() {
   if ! curl -fsSL -o "$TMPF/ffmpeg.zip" "$FF_URL"; then
     echo "FFmpeg download failed - check your internet connection."
@@ -229,7 +256,9 @@ stage_helper() {
   chmod +x "$BACKEND/bin/yt-dlp"
   cp "$TMPF/ffmpeg.bin" "$BACKEND/bin/ffmpeg"
   cp "$TMPF/ffprobe.bin" "$BACKEND/bin/ffprobe"
-  chmod +x "$BACKEND/bin/ffmpeg" "$BACKEND/bin/ffprobe"
+  cp "$TMPF/deno.bin" "$BACKEND/bin/deno"
+  cp "$TMPF/deno.LICENSE.txt" "$BACKEND/bin/deno.LICENSE.txt"
+  chmod +x "$BACKEND/bin/ffmpeg" "$BACKEND/bin/ffprobe" "$BACKEND/bin/deno"
   cp -R "$TMPF/python" "$BACKEND/runtime/python"
   touch "$BACKEND/.umd-rc"
   echo "helper installed in ~/.universal-media-downloader-rc"
@@ -278,6 +307,11 @@ banner
 
 # Pinned download sources per processor, selected at the top level so every
 # stage sees them (stages run in subshells and cannot share variables).
+# Deno: the JavaScript runtime current yt-dlp needs for YouTube's JS
+# challenges (yt-dlp announcement, github.com/yt-dlp/yt-dlp/issues/14404).
+# Pinned tag; checksum fetched from the release's own .sha256sum at install
+# time, same trust model as the engine.
+DENO_TAG="v2.9.8"
 ARCH=$(uname -m)
 case "$ARCH" in
   arm64)
@@ -300,6 +334,7 @@ esac
 printf '%s%sCurrently at step 1/%s%s\n\n' "$WHITE" "$BOLD" "$STAGE_TOTAL" "$RESET"
 stage "Checking your setup" stage_check
 stage "Downloading the yt-dlp engine (latest official release)" stage_ytdlp
+stage "Downloading the Deno JavaScript runtime (needed for YouTube)" stage_deno
 stage "Downloading FFmpeg + FFprobe (pinned 9.0.2 build)" stage_ffmpeg
 stage "Downloading the private Python runtime (pinned; your system Python is never touched)" stage_python
 stage "Installing the local helper" stage_helper

@@ -13,6 +13,23 @@
 # Desktop, which you can move anywhere BEFORE importing.
 # Isolation promise: registers ONLY the native-messaging host "com.umd.bridge.rc" in HKCU.
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 network defaults: allow TLS 1.2 (GitHub requires it) and
+# skip the download progress bar, which makes large downloads crawl under 5.1.
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$ProgressPreference = 'SilentlyContinue'
+# Windows PowerShell 5.1 returns .Content as a byte[] for octet-stream responses
+# (that is how GitHub serves release files); decode those to text explicitly.
+function Get-WebText($resp) {
+  $c = $resp.Content
+  if ($c -is [byte[]]) { return [Text.Encoding]::UTF8.GetString($c) }
+  return [string]$c
+}
+
+# Deno: the JavaScript runtime current yt-dlp needs for YouTube's JS
+# challenges (yt-dlp announcement, github.com/yt-dlp/yt-dlp/issues/14404).
+# Pinned to a tested release; verified against the release's own published
+# .sha256sum below, same trust model as the engine and FFmpeg downloads.
+$DenoTag = 'v2.9.8'
 
 # bright palette: white = work in progress, green = success, red = error,
 # magenta = Aryzen Nex, dark gray = timestamps and details,
@@ -26,7 +43,7 @@ function Gradline($line) {
   $colors = $Grad
   $n = $line.Length
   for ($i = 0; $i -lt $n; $i++) {
-    $seg = [int]($i * 5 / [math]::Max($n, 1))
+    $seg = [int][math]::Floor($i * 5 / [math]::Max($n, 1))
     Write-Host $line[$i] -NoNewline -ForegroundColor $colors[$seg]
   }
   Write-Host ''
@@ -62,7 +79,7 @@ $CounterTop = 0
 
 function Write-At($row, $text, $color) {
   [Console]::SetCursorPosition(0, $row)
-  Write-Host ($text.PadRight([Console]::WindowWidth - 1)) -NoNewline -ForegroundColor $color
+  Write-Host ($text.PadRight([math]::Max(10, [Console]::WindowWidth - 1))) -NoNewline -ForegroundColor $color
 }
 function Update-Counter($n) {
   Write-At $CounterTop "Currently at step $n/$StageTotal" White
@@ -89,6 +106,7 @@ function Invoke-Stage($Label, [scriptblock]$Body) {
     Write-Host ('[{0}] x {1}' -f (Stamp), $Label) -ForegroundColor Red
     $script:HistLines++
     Write-Host "             $failed" -ForegroundColor Red
+    Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
     exit 1
   }
   Write-Host ('[{0}] ' -f (Stamp)) -NoNewline -ForegroundColor DarkGray
@@ -116,7 +134,7 @@ Invoke-Stage 'Checking your setup' {
   $py = $null
   foreach ($cand in @('py -3', 'python')) {
     try {
-      $v = Invoke-Expression "$cand -c `"import sys; print('%d.%d' % sys.version_info[:2])`" 2>$null
+      $v = Invoke-Expression "$cand -c `"import sys; print('%d.%d' % sys.version_info[:2])`"" 2>$null
       if ($LASTEXITCODE -eq 0 -and $v) {
         $parts = $v.Split('.')
         if ([int]$parts[0] -gt 3 -or ([int]$parts[0] -eq 3 -and [int]$parts[1] -ge 11)) { $py = $cand; break }
@@ -134,22 +152,22 @@ New-Item -ItemType Directory -Force -Path $stage | Out-Null
 # Download and verify everything BEFORE writing anything to the install
 # folder, so a failed or tampered download really does leave nothing installed.
 Invoke-Stage 'Downloading the yt-dlp engine (latest official release)' {
-  try { $rel = Invoke-RestMethod 'https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest' }
+  try { $rel = Invoke-RestMethod -UseBasicParsing 'https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest' }
   catch { throw 'could not reach GitHub - check your internet connection and run this again.' }
   $tag = $rel.tag_name
-  $sums = (Invoke-WebRequest "https://github.com/yt-dlp/yt-dlp/releases/download/$tag/SHA2-256SUMS").Content
-  $want = ($sums -split "`n" | Where-Object { $_ -match '\syt-dlp$' } | ForEach-Object { ($_ -split '\s+')[0] })[0]
+  $sums = Get-WebText (Invoke-WebRequest -UseBasicParsing "https://github.com/yt-dlp/yt-dlp/releases/download/$tag/SHA2-256SUMS")
+  $want = @($sums -split "`r?`n" | Where-Object { $_ -match '\syt-dlp$' } | ForEach-Object { ($_ -split '\s+')[0] })[0]
   if (-not $want) { throw 'could not read the official yt-dlp checksum' }
-  Invoke-WebRequest -OutFile "$stage\yt-dlp" "https://github.com/yt-dlp/yt-dlp/releases/download/$tag/yt-dlp"
+  Invoke-WebRequest -UseBasicParsing -OutFile "$stage\yt-dlp" "https://github.com/yt-dlp/yt-dlp/releases/download/$tag/yt-dlp"
   $got = (Get-FileHash "$stage\yt-dlp" -Algorithm SHA256).Hash.ToLower()
   if ($got -ne $want.ToLower()) { throw 'yt-dlp checksum mismatch - nothing was installed' }
   $script:Detail = "yt-dlp $tag downloaded and SHA-256 verified"
 }
 
 Invoke-Stage 'Downloading FFmpeg (latest gyan.dev essentials build)' {
-  $ffzip = Join-Path $env:TEMP 'umd-ffmpeg.zip'
-  Invoke-WebRequest -OutFile $ffzip 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
-  $wantFf = ((Invoke-WebRequest 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256').Content -split '\s+')[0].Trim()
+  $ffzip = Join-Path $stage 'umd-ffmpeg.zip'
+  Invoke-WebRequest -UseBasicParsing -OutFile $ffzip 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+  $wantFf = ((Get-WebText (Invoke-WebRequest -UseBasicParsing 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256')) -split '\s+')[0].Trim()
   $gotFf = (Get-FileHash $ffzip -Algorithm SHA256).Hash.ToLower()
   if (-not $wantFf -or $gotFf -ne $wantFf.ToLower()) {
     Remove-Item $ffzip -Force -ErrorAction SilentlyContinue
@@ -165,6 +183,30 @@ Invoke-Stage 'Downloading FFmpeg (latest gyan.dev essentials build)' {
   $script:Detail = 'FFmpeg and FFprobe downloaded and verified against the publisher SHA-256'
 }
 
+Invoke-Stage 'Downloading the Deno JavaScript runtime (needed for YouTube)' {
+  $darch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+  $durl = "https://github.com/denoland/deno/releases/download/$DenoTag/deno-$darch-pc-windows-msvc.zip"
+  $dzip = Join-Path $stage 'umd-deno.zip'
+  Invoke-WebRequest -UseBasicParsing -OutFile $dzip $durl
+  # The published .sha256sum file is a PowerShell-style table on the Windows
+  # assets; pull the 64-hex token out of it rather than parsing columns.
+  $wantD = [regex]::Match((Get-WebText (Invoke-WebRequest -UseBasicParsing "$durl.sha256sum")), '[0-9a-fA-F]{64}').Value
+  $gotD = (Get-FileHash $dzip -Algorithm SHA256).Hash.ToLower()
+  if (-not $wantD -or $gotD -ne $wantD.ToLower()) {
+    Remove-Item $dzip -Force -ErrorAction SilentlyContinue
+    throw 'Deno checksum mismatch - nothing was installed'
+  }
+  Expand-Archive -Force $dzip (Join-Path $stage 'umd-deno')
+  $de = Get-ChildItem -Recurse -Filter deno.exe (Join-Path $stage 'umd-deno') | Select-Object -First 1
+  if (-not $de) { throw 'could not unpack the Deno runtime - nothing was installed' }
+  Remove-Item -Force $dzip -ErrorAction SilentlyContinue
+  # Deno is MIT-licensed; the license text must accompany the binary.
+  Invoke-WebRequest -UseBasicParsing -OutFile (Join-Path $stage 'deno.LICENSE.txt') "https://raw.githubusercontent.com/denoland/deno/$DenoTag/LICENSE.md"
+  if (-not (Select-String -Path (Join-Path $stage 'deno.LICENSE.txt') -Pattern 'MIT License' -Quiet)) { throw 'could not fetch the Deno license text - nothing was installed' }
+  $script:DenoExe = $de.FullName
+  $script:Detail = "Deno $DenoTag runtime downloaded and verified against the publisher SHA-256"
+}
+
 Invoke-Stage 'Installing the local helper' {
   if (Test-Path $Backend) { Remove-Item -Recurse -Force $Backend }
   New-Item -ItemType Directory -Force -Path "$Backend\bridge", "$Backend\bin" | Out-Null
@@ -172,6 +214,8 @@ Invoke-Stage 'Installing the local helper' {
   Copy-Item -Force "$stage\yt-dlp" "$Backend\bin\yt-dlp"
   Copy-Item -Force $script:FfExe "$Backend\bin\ffmpeg.exe"
   Copy-Item -Force $script:FpExe "$Backend\bin\ffprobe.exe"
+  Copy-Item -Force $script:DenoExe "$Backend\bin\deno.exe"
+  Copy-Item -Force (Join-Path $stage 'deno.LICENSE.txt') "$Backend\bin\deno.LICENSE.txt"
   New-Item -ItemType File -Force -Path (Join-Path $Backend '.umd-rc') | Out-Null
   $script:Detail = 'helper installed in %LOCALAPPDATA%\universal-media-downloader-rc'
 }
@@ -179,7 +223,9 @@ Invoke-Stage 'Installing the local helper' {
 Invoke-Stage 'Connecting the helper to your browser(s)' {
   $launcher = ($Backend + '\bridge\run-host.bat') -replace '\\', '\\\\'
   $manifest = (Get-Content "$Src\bridge\com.umd.bridge.rc.json" -Raw).Replace('HOST_LAUNCHER_PATH', $launcher)
-  Set-Content -Path "$Backend\bridge\com.umd.bridge.rc.json" -Value $manifest
+  # UTF-8 without BOM: the path may contain non-ASCII (e.g. accented usernames),
+  # and 5.1's Set-Content default encoding would mangle it.
+  [IO.File]::WriteAllText("$Backend\bridge\com.umd.bridge.rc.json", $manifest, (New-Object Text.UTF8Encoding($false)))
   foreach ($key in @('HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.umd.bridge.rc',
                      'HKCU:\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.umd.bridge.rc')) {
     New-Item -Path $key -Force | Out-Null

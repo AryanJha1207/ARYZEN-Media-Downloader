@@ -33,6 +33,14 @@ import subprocess
 import sys
 import threading
 import time
+
+# Native messaging frames are length-prefixed binary. On Windows the C runtime
+# starts stdin/stdout in text mode, which rewrites every 0x0A byte to 0x0D 0x0A
+# and corrupts frame headers; force binary mode there. No effect elsewhere.
+if os.name == "nt":
+    import msvcrt
+    msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+    msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
@@ -48,7 +56,14 @@ RELEASE_DL = "https://github.com/yt-dlp/yt-dlp/releases/download/{tag}/{name}"
 
 MAX_URL_LEN = 2048
 MAX_CONCURRENT = 3
+# Warm-engine probe budget. Cold first runs are covered by the warm-up thread
+# at bridge start plus the extension's page-load ping, not by inflating this.
 PROBE_TIMEOUT = 8
+# A download started soon after a probe can reuse that probe's saved engine
+# answer (--load-info-json) instead of re-reading the page. Kept SHORT on
+# purpose: signed media URLs can die within minutes on some networks, so an
+# entry older than this is treated as absent and the page is read fresh.
+PROBE_INFO_TTL = 120
 VERSION_CACHE = {}
 
 _send_lock = threading.Lock()
@@ -122,8 +137,17 @@ def base_args():
     # options the user never asked this app for).
     # sys.executable: the zipapp is pure Python; run it with the interpreter
     # already running this bridge (no PATH/env dependence, no Gatekeeper event).
-    return [sys.executable, str(YTDLP), "--ignore-config", "--no-plugin-dirs", "--no-playlist",
+    args = [sys.executable, str(YTDLP), "--ignore-config", "--no-plugin-dirs", "--no-playlist",
             "--no-warnings", "--no-color", "--ffmpeg-location", str(BIN)]
+    # YouTube extraction requires a real JavaScript runtime for its JS
+    # challenges (yt-dlp announcement #14404). Deno is the only runtime
+    # yt-dlp auto-detects; point it at the copy our installer placed in
+    # bin/ so it works without any PATH setup. Absent = old installs keep
+    # their previous (degraded) behavior.
+    deno = BIN / ("deno.exe" if os.name == "nt" else "deno")
+    if deno.exists():
+        args += ["--js-runtimes", "deno:" + str(deno)]
+    return args
 
 
 def friendly_error(stderr_text):
@@ -157,7 +181,11 @@ def build_options(info):
             continue
         vc, ac = f.get("vcodec"), f.get("acodec")
         h = f.get("height")
-        if vc and vc != "none" and h:
+        # Some extractors (e.g. Streamable's single-file probe) leave BOTH
+        # codec fields null - unknown is not "none". A media file with a
+        # height and unknown codecs is still downloadable video.
+        codecs_unknown = vc is None and ac is None
+        if h and ((vc and vc != "none") or codecs_unknown):
             fps = f.get("fps") or 0
             dr = (f.get("dynamic_range") or "SDR").upper()
             key = (int(h), int(round(fps)), dr)
@@ -168,6 +196,8 @@ def build_options(info):
         if (not vc or vc == "none") and ac and ac != "none":
             have_audio = True
         elif vc and vc != "none" and ac and ac != "none":
+            have_audio = True
+        elif codecs_unknown and h:
             have_audio = True
 
     opts = []
@@ -196,50 +226,207 @@ def build_options(info):
     return opts
 
 
+# A probe that outlives its caller's 8-second budget is no longer killed:
+# the engine keeps running (bounded by PROBE_LINGER_CAP) and a successful
+# result is cached, so the user's next attempt rides the work already done
+# instead of restarting a slow fetch from zero. One engine process per URL;
+# concurrent requests for the same URL share it. Feedback still reaches the
+# caller at PROBE_TIMEOUT seconds; nothing retries on its own.
+PROBE_RESULT_TTL = 180
+PROBE_LINGER_CAP = 45
+MAX_INFLIGHT_PROBES = 3
+
+_probe_cache = {}     # url -> (monotonic_ts, payload dict incl. "ok": True, info_json_path|None)
+
+
+# Saved probe answers hold signed CDN URLs: they live in a private temp dir,
+# owner-read-only files, and are deleted on use, on expiry/eviction, and at
+# bridge exit. Never written to the log.
+import atexit
+import tempfile
+
+_INFO_DIR = None
+
+
+def _info_dir():
+    global _INFO_DIR
+    if _INFO_DIR is None:
+        _INFO_DIR = tempfile.mkdtemp(prefix="umd-info-")
+        try:
+            os.chmod(_INFO_DIR, 0o700)
+        except Exception:
+            pass
+    return _INFO_DIR
+
+
+def _save_info_json(raw):
+    try:
+        fd, p = tempfile.mkstemp(prefix="p-", suffix=".json", dir=_info_dir())
+        with os.fdopen(fd, "w") as f:
+            f.write(raw)
+        try:
+            os.chmod(p, 0o600)
+        except Exception:
+            pass
+        return p
+    except Exception as e:
+        log("info-json save failed: %r" % e)
+        return None
+
+
+def _drop_info_file(path):
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except Exception:
+        pass
+
+
+def _cleanup_info_dir():
+    if _INFO_DIR:
+        try:
+            for n in os.listdir(_INFO_DIR):
+                _drop_info_file(os.path.join(_INFO_DIR, n))
+            os.rmdir(_INFO_DIR)
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_info_dir)
+_probe_inflight = {}  # url -> {"proc", "started", "waiters": {rid: Timer}}
+_probe_lock = threading.Lock()
+
+
+def _probe_timeout_msg(rid):
+    # Sent only when the engine hits the hard PROBE_LINGER_CAP: by then the
+    # caller has been watching a progress note for most of the wait. No
+    # promise about the next attempt: a killed engine leaves nothing cached
+    # here, so a retry starts fresh.
+    send({"id": rid, "type": "result", "ok": False, "code": "probe-timeout",
+          "error": "That page still hasn't answered after 45 seconds. "
+                   "Close this and try again."})
+
+
+def _probe_waiter_progress(url, rid):
+    # At PROBE_TIMEOUT seconds the probe is usually still legitimately
+    # working (YouTube challenge solving can take a while). Tell the caller
+    # it is alive instead of failing it; the waiter stays registered and
+    # gets the real result when the engine finishes, or the cap error.
+    with _probe_lock:
+        st = _probe_inflight.get(url)
+        if not st or rid not in st["waiters"]:
+            return
+    send({"id": rid, "type": "probe-working",
+          "after": PROBE_TIMEOUT, "cap": PROBE_LINGER_CAP})
+
+
+def _probe_add_waiter(st, url, rid):
+    t = threading.Timer(PROBE_TIMEOUT, _probe_waiter_progress, args=(url, rid))
+    t.daemon = True
+    st["waiters"][rid] = t
+    t.start()
+
+
+def _probe_cache_put(url, payload, info_path=None):
+    if len(_probe_cache) >= 50:
+        oldest = min(_probe_cache, key=lambda u: _probe_cache[u][0])
+        old = _probe_cache.pop(oldest, None)
+        if old:
+            _drop_info_file(old[2])
+    _probe_cache[url] = (time.monotonic(), payload, info_path)
+
+
+def _probe_watch(url, st):
+    proc = st["proc"]
+    killed = False
+    try:
+        out, err = proc.communicate(timeout=PROBE_LINGER_CAP)
+    except subprocess.TimeoutExpired:
+        killed = True
+        proc.kill()
+        try:
+            out, err = proc.communicate(timeout=10)
+        except Exception:
+            out, err = "", ""
+    except Exception as e:
+        log("probe wait error: %r" % e)
+        killed = True
+        out, err = "", ""
+
+    payload = None
+    if not killed:
+        if proc.returncode != 0:
+            payload = {"ok": False, "error": friendly_error(err)}
+        else:
+            try:
+                info = json.loads(out)
+            except Exception:
+                info = None
+            if info is None:
+                payload = {"ok": False,
+                           "error": "The downloader returned unreadable data for that page."}
+            elif info.get("_type") == "playlist" or info.get("entries"):
+                payload = {"ok": False,
+                           "error": "That link is a playlist. Open a single video and try again."}
+            else:
+                payload = {"ok": True, "info": {
+                    "title": info.get("title") or "Untitled media",
+                    "site": info.get("extractor_key") or "",
+                    "uploader": info.get("uploader") or info.get("channel") or "",
+                    "duration": info.get("duration"),
+                    "thumbnail": info.get("thumbnail"),
+                }, "options": build_options(info)}
+
+    with _probe_lock:
+        _probe_inflight.pop(url, None)
+        waiters = list(st["waiters"].items())
+        st["waiters"].clear()
+        if payload and payload["ok"]:
+            _probe_cache_put(url, payload, _save_info_json(out))
+    for rid, timer in waiters:
+        timer.cancel()
+        if payload is None:
+            _probe_timeout_msg(rid)
+        else:
+            send(dict({"id": rid, "type": "result"}, **payload))
+
+
 def do_probe(rid, url):
     host = (urlparse(url).hostname or "").lower()
     if "spotify.com" in host:
         send({"id": rid, "type": "result", "ok": False,
               "error": "Spotify streams are copy-protected (DRM) and cannot be downloaded."})
         return
-    try:
-        p = subprocess.run(base_args() + ["-J", "--", url],
-                           capture_output=True, text=True, timeout=PROBE_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        send({"id": rid, "type": "result", "ok": False,
-              "error": "That site took too long to answer (over 8 seconds). Try again."})
-        return
-    except Exception as e:
-        log("probe spawn error: %r" % e)
-        send({"id": rid, "type": "result", "ok": False,
-              "error": "Could not start the downloader engine."})
-        return
-    if p.returncode != 0:
-        send({"id": rid, "type": "result", "ok": False,
-              "error": friendly_error(p.stderr)})
-        return
-    try:
-        info = json.loads(p.stdout)
-    except Exception:
-        send({"id": rid, "type": "result", "ok": False,
-              "error": "The downloader returned unreadable data for that page."})
-        return
-    if info.get("_type") == "playlist" or info.get("entries"):
-        send({"id": rid, "type": "result", "ok": False,
-              "error": "That link is a playlist. Open a single video and try again."})
-        return
-    note = None
-    out = {
-        "title": info.get("title") or "Untitled media",
-        "site": info.get("extractor_key") or "",
-        "uploader": info.get("uploader") or info.get("channel") or "",
-        "duration": info.get("duration"),
-        "thumbnail": info.get("thumbnail"),
-    }
-    opts = build_options(info)
-    if note:
-        out["note"] = note
-    send({"id": rid, "type": "result", "ok": True, "info": out, "options": opts})
+    with _probe_lock:
+        ent = _probe_cache.get(url)
+        if ent is not None:
+            if time.monotonic() - ent[0] < PROBE_RESULT_TTL:
+                send(dict({"id": rid, "type": "result"}, **ent[1]))
+                return
+            _probe_cache.pop(url, None)
+            _drop_info_file(ent[2])
+        st = _probe_inflight.get(url)
+        if st is not None:
+            _probe_add_waiter(st, url, rid)
+            return
+        if len(_probe_inflight) >= MAX_INFLIGHT_PROBES:
+            send({"id": rid, "type": "result", "ok": False, "code": "probe-busy",
+                  "error": "The helper is busy reading another page. Give it a few seconds, then try again."})
+            return
+        try:
+            proc = subprocess.Popen(base_args() + ["-J", "--", url],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+        except Exception as e:
+            log("probe spawn error: %r" % e)
+            send({"id": rid, "type": "result", "ok": False,
+                  "error": "Could not start the downloader engine."})
+            return
+        st = {"proc": proc, "started": time.monotonic(), "waiters": {}}
+        _probe_inflight[url] = st
+        _probe_add_waiter(st, url, rid)
+    threading.Thread(target=_probe_watch, args=(url, st), daemon=True).start()
 
 
 # ---------------- download ----------------
@@ -250,6 +437,19 @@ ETA = re.compile(r"\sETA\s+(\S+)")
 DEST = re.compile(r"Destination:\s*(.+)$")
 MERGE = re.compile(r'Merging formats into "(.+)"')
 ALREADY = re.compile(r"^\[download\]\s+(.+?)\s+has already been downloaded")
+
+
+# Failure signature that justifies the ONE fresh-fetch fallback: the saved
+# probe answer pointed at media URLs the CDN has already dropped. Anything
+# else (disk, permissions, postprocessing, user cancel, unknown) surfaces as
+# a plain error - the fallback never duplicates postprocessing or overrides
+# the user.
+# Anchored to the media-fetch line so a thumbnail/subtitle/metadata 404 can
+# never trigger the fallback. (404 counts here: this pattern is only
+# consulted right after a probe that DID find the media, so a media-URL 404
+# at that point means the saved link died, not that the video vanished.)
+STALE_SOURCE_RE = re.compile(
+    r"(unable to download video data|Got error): HTTP Error (403|404|410)")
 
 
 def run_download(rid, url, kind, selector, mp3):
@@ -266,74 +466,119 @@ def run_download(rid, url, kind, selector, mp3):
                      "--audio-format", "mp3", "--audio-quality", "%dK" % mp3]
         else:
             args += ["-f", "ba/b"]
-        args += ["--", url]
 
-        proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True)
-        with _jobs_lock:
-            _active_procs[rid] = proc
-            _jobs[rid] = {"state": "running"}
+        # Fast start: reuse the probe answer saved moments ago instead of
+        # re-reading the page. Only inside the short TTL; the plain URL path
+        # below is today's behavior and stays the fallback and the default.
+        info_path = None
+        with _probe_lock:
+            ent = _probe_cache.get(url)
+            if ent is not None and time.monotonic() - ent[0] < PROBE_INFO_TTL:
+                info_path = ent[2]
+        attempts = []
+        if info_path:
+            attempts.append(["--load-info-json", info_path])
+        attempts.append(["--", url])
 
-        final_path = None
-        saw_merge = False
-        destinations = set()
-        last_lines = []
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            last_lines.append(line)
-            del last_lines[:-8]
-            m = ALREADY.match(line)
-            if m:
-                final_path = m.group(1).strip()
-                continue
-            m = MERGE.search(line)
-            if m:
-                saw_merge = True
-                final_path = m.group(1).strip()
-                send({"type": "progress", "job": rid, "pct": 99.0,
-                      "stage": "merging", "ts": time.time()})
-                continue
-            if "[ExtractAudio]" in line:
+        def job_cancelled():
+            with _jobs_lock:
+                j = _jobs.get(rid) or {}
+            return bool(j.get("cancelled"))
+
+        # Run one engine attempt; returns its outcome. Progress reporting is
+        # identical for both source forms because the engine's output lines
+        # are the same either way.
+        def attempt(tail_args):
+            nonlocal proc
+            res = {"ret": None, "final": None, "saw_merge": False,
+                   "saw_post": False, "destinations": set(), "tail": []}
+            proc = subprocess.Popen(args + tail_args, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True)
+            with _jobs_lock:
+                _active_procs[rid] = proc
+                _jobs[rid] = {"state": "running"}
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                res["tail"].append(line)
+                del res["tail"][:-8]
+                m = ALREADY.match(line)
+                if m:
+                    res["final"] = m.group(1).strip()
+                    continue
+                m = MERGE.search(line)
+                if m:
+                    res["saw_merge"] = True
+                    res["saw_post"] = True
+                    res["final"] = m.group(1).strip()
+                    send({"type": "progress", "job": rid, "pct": 99.0,
+                          "stage": "merging", "ts": time.time()})
+                    continue
+                if "[ExtractAudio]" in line:
+                    res["saw_post"] = True
+                    m = DEST.search(line)
+                    if m:
+                        res["final"] = m.group(1).strip()
+                    send({"type": "progress", "job": rid, "pct": 99.0,
+                          "stage": "converting audio", "ts": time.time()})
+                    continue
+                if "[Fixup]" in line or "[VideoRemuxer]" in line or "[Metadata]" in line:
+                    res["saw_post"] = True
+                    send({"type": "progress", "job": rid, "pct": 99.0,
+                          "stage": "finishing", "ts": time.time()})
+                    continue
                 m = DEST.search(line)
                 if m:
-                    final_path = m.group(1).strip()
-                send({"type": "progress", "job": rid, "pct": 99.0,
-                      "stage": "converting audio", "ts": time.time()})
-                continue
-            if "[Fixup]" in line or "[VideoRemuxer]" in line or "[Metadata]" in line:
-                send({"type": "progress", "job": rid, "pct": 99.0,
-                      "stage": "finishing", "ts": time.time()})
-                continue
-            m = DEST.search(line)
-            if m:
-                destinations.add(m.group(1).strip())
-                final_path = m.group(1).strip()
-            m = PCT.search(line)
-            if m:
-                sp = SPEED.search(line)
-                et = ETA.search(line)
-                send({"type": "progress", "job": rid,
-                      "pct": min(float(m.group(1)), 100.0),
-                      "speed": sp.group(1) if sp else "",
-                      "eta": et.group(1) if et else "",
-                      "ts": time.time()})
-        proc.wait()
+                    res["destinations"].add(m.group(1).strip())
+                    res["final"] = m.group(1).strip()
+                m = PCT.search(line)
+                if m:
+                    sp = SPEED.search(line)
+                    et = ETA.search(line)
+                    send({"type": "progress", "job": rid,
+                          "pct": min(float(m.group(1)), 100.0),
+                          "speed": sp.group(1) if sp else "",
+                          "eta": et.group(1) if et else "",
+                          "ts": time.time()})
+            proc.wait()
+            res["ret"] = proc.returncode
+            return res
+
+        r = attempt(attempts[0])
+        if (len(attempts) == 2 and r["ret"] not in (0, None)
+                and not job_cancelled()
+                and r["ret"] is not None and r["ret"] >= 0
+                and not r["saw_post"]
+                and STALE_SOURCE_RE.search("\n".join(r["tail"]))):
+            # Stale saved answer: forget it and read the page fresh, once.
+            log("saved probe answer was stale; retrying with a fresh read")
+            with _probe_lock:
+                old = _probe_cache.pop(url, None)
+            if old:
+                _drop_info_file(old[2])
+            r = attempt(attempts[1])
+        # The saved answer is single-use: never keep it after a download try.
+        _drop_info_file(info_path)
+        with _probe_lock:
+            ent = _probe_cache.get(url)
+            if ent is not None and ent[2] == info_path:
+                _probe_cache[url] = (ent[0], ent[1], None)
+
         # A "+" selector only sometimes means separate files: on progressive
         # streams yt-dlp falls back to one combined file, which is a fine
         # outcome. It is a failure only when several parts downloaded and no
         # merge happened.
         merge_needed = "+" in selector and kind == "video"
-        if proc.returncode == 0 and merge_needed and not saw_merge and len(destinations) > 1:
+        if r["ret"] == 0 and merge_needed and not r["saw_merge"] and len(r["destinations"]) > 1:
             send({"type": "error", "job": rid,
                   "error": "The streams downloaded but could not be merged "
                            "(FFmpeg stopped working). The separate files are in "
                            "Downloads/UMD; re-run the setup script to repair, "
                            "then download again."})
             return
-        if proc.returncode == 0:
+        if r["ret"] == 0:
             name = None
-            if final_path:
-                pth = Path(final_path)
+            if r["final"]:
+                pth = Path(r["final"])
                 if pth.exists():
                     name = pth.name
             if not name:
@@ -344,11 +589,11 @@ def run_download(rid, url, kind, selector, mp3):
                     name = "file"
             send({"type": "done", "job": rid, "file": name, "ts": time.time()})
         else:
-            if proc.returncode is not None and proc.returncode < 0:
+            if job_cancelled() or (r["ret"] is not None and r["ret"] < 0):
                 send({"type": "error", "job": rid, "error": "Cancelled."})
             else:
                 send({"type": "error", "job": rid,
-                      "error": friendly_error("\n".join(last_lines))})
+                      "error": friendly_error("\n".join(r["tail"]))})
     except Exception as e:
         log("download error: %r" % e)
         send({"type": "error", "job": rid,
@@ -405,6 +650,9 @@ def do_download(rid, msg):
 def do_cancel(rid, msg):
     job = msg.get("job")
     with _jobs_lock:
+        j = _jobs.get(job)
+        if j is not None:
+            j["cancelled"] = True
         proc = _active_procs.get(job)
     if proc and proc.poll() is None:
         try:
@@ -493,6 +741,12 @@ def do_versions(rid):
             versions["ffmpeg"] = fv.splitlines()[0].split(" ")[2] if fv else None
         except Exception:
             versions["ffmpeg"] = None
+        try:
+            dv = subprocess.run([str(BIN / ("deno.exe" if os.name == "nt" else "deno")), "--version"],
+                                capture_output=True, text=True, timeout=5).stdout
+            versions["deno"] = dv.splitlines()[0].split(" ")[1] if dv else None
+        except Exception:
+            versions["deno"] = None
         VERSION_CACHE["versions"] = versions
     send({"id": rid, "type": "result", "ok": True,
           "versions": VERSION_CACHE["versions"]})
@@ -559,7 +813,51 @@ def main():
                   "error": "Unexpected helper error."})
 
 
+def warm_engine():
+    # The first execution of the engine on a cold machine can take far longer
+    # than PROBE_TIMEOUT (interpreter start, zip import, antivirus scan). Run
+    # it here, in the background, at bridge start so the first real probe is
+    # warm. Never blocks startup, ping, or any request.
+    try:
+        subprocess.run([sys.executable, str(YTDLP), "--version"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=45)
+    except Exception:
+        pass
+
+
+def _sweep_info_orphans():
+    # A bridge killed before atexit leaves its private temp dir behind. Remove
+    # saved probe answers older than 10 minutes at startup (a live sibling
+    # bridge's fresh files are untouched), then the empty dir.
+    try:
+        tmp = tempfile.gettempdir()
+        cutoff = time.time() - 600
+        for n in os.listdir(tmp):
+            if not n.startswith("umd-info-"):
+                continue
+            d = os.path.join(tmp, n)
+            if d == _INFO_DIR or not os.path.isdir(d):
+                continue
+            try:
+                for f in os.listdir(d):
+                    p = os.path.join(d, f)
+                    try:
+                        if os.path.getmtime(p) < cutoff:
+                            os.unlink(p)
+                    except Exception:
+                        pass
+                if not os.listdir(d):
+                    os.rmdir(d)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    _sweep_info_orphans()
+    threading.Thread(target=warm_engine, daemon=True).start()
     log("bridge started (python " + sys.version.split()[0] + ")")
     try:
         main()

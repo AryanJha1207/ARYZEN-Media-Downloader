@@ -75,7 +75,7 @@ banner() {
 # animation the author linked (lottiefiles.com/free-animation/loading-99FrBcVjYZ);
 # no Lottie asset, code or license material is used - the spinner is a plain
 # terminal convention drawn from scratch in the AMD gradient colors.
-STAGE_TOTAL=5
+STAGE_TOTAL=6
 STEPN=0
 HIST=0
 SAVE="$ESC"7
@@ -206,6 +206,40 @@ stage_download() {
   echo "yt-dlp $TAG downloaded and SHA-256 verified"
 }
 
+stage_deno() {
+  case "$(uname -m)" in
+    x86_64) DZIP="deno-x86_64-unknown-linux-gnu.zip" ;;
+    aarch64|arm64) DZIP="deno-aarch64-unknown-linux-gnu.zip" ;;
+    *) echo "unsupported processor for the Deno runtime: $(uname -m)"; return 1 ;;
+  esac
+  if ! curl -fsSL -o "$TMPWORK/deno.zip" "https://github.com/denoland/deno/releases/download/$DENO_TAG/$DZIP"; then
+    echo "Deno runtime download failed - check your internet connection."
+    return 1
+  fi
+  WANTD=$(curl -fsSL "https://github.com/denoland/deno/releases/download/$DENO_TAG/$DZIP.sha256sum" | grep -Eo '[0-9a-fA-F]{64}' | head -1 | tr 'A-F' 'a-f') || true
+  if [ -z "$WANTD" ]; then
+    echo "could not read the official Deno checksum."
+    return 1
+  fi
+  GOTD=$(sha256sum "$TMPWORK/deno.zip" | awk '{print $1}')
+  if [ "$GOTD" != "$WANTD" ]; then
+    echo "Deno checksum mismatch - nothing was installed."
+    return 1
+  fi
+  # python3 (already required by this installer) unpacks the zip - no unzip dependency.
+  python3 -m zipfile -e "$TMPWORK/deno.zip" "$TMPWORK/deno-x/"
+  if [ ! -f "$TMPWORK/deno-x/deno" ]; then
+    echo "downloaded Deno archive did not contain the expected binary - nothing was installed."
+    return 1
+  fi
+  # Deno is MIT-licensed; the license text must accompany the binary.
+  if ! curl -fsSL -o "$TMPWORK/deno.LICENSE.txt" "https://raw.githubusercontent.com/denoland/deno/$DENO_TAG/LICENSE.md" || ! grep -q 'MIT License' "$TMPWORK/deno.LICENSE.txt"; then
+    echo "could not fetch the Deno license text - nothing was installed."
+    return 1
+  fi
+  echo "Deno $DENO_TAG runtime downloaded and SHA-256 verified"
+}
+
 stage_helper() {
   [ ! -e "$BACKEND" ] || rm -rf "$BACKEND"
   mkdir -p "$BACKEND/bridge" "$BACKEND/bin"
@@ -215,6 +249,9 @@ stage_helper() {
   chmod +x "$BACKEND/bin/yt-dlp"
   ln -sf "$(command -v ffmpeg)" "$BACKEND/bin/ffmpeg"
   ln -sf "$(command -v ffprobe)" "$BACKEND/bin/ffprobe"
+  cp "$TMPWORK/deno-x/deno" "$BACKEND/bin/deno"
+  cp "$TMPWORK/deno.LICENSE.txt" "$BACKEND/bin/deno.LICENSE.txt"
+  chmod +x "$BACKEND/bin/deno"
   touch "$BACKEND/.umd-rc"
   echo "helper installed in ~/.universal-media-downloader-rc"
 }
@@ -255,10 +292,14 @@ NOTE
   echo "project folder ready on your Desktop"
 }
 
+# Deno: the JavaScript runtime current yt-dlp needs for YouTube's JS
+# challenges (yt-dlp announcement, github.com/yt-dlp/yt-dlp/issues/14404).
+DENO_TAG="v2.9.8"
 banner
 printf '%s%sCurrently at step 1/%s%s\n\n' "$WHITE" "$BOLD" "$STAGE_TOTAL" "$RESET"
 stage "Checking your setup" stage_check
 stage "Downloading the yt-dlp engine (latest official release)" stage_download
+stage "Downloading the Deno JavaScript runtime (needed for YouTube)" stage_deno
 stage "Installing the local helper" stage_helper
 stage "Connecting the helper to your browser(s)" stage_register
 stage "Creating your project folder on the Desktop" stage_desktop

@@ -12,31 +12,52 @@ const state = {
   options: [],
   selected: null,
   job: null,
+  announced: -1,
 };
 
-function show(el) { el.hidden = false; }
-function hide(el) { el.hidden = true; }
+function show(el) {
+  if (!el) return;
+  if (el.hidden) {
+    el.hidden = false;
+    // one quiet enter per state change: fade + 4px rise (off under reduced motion)
+    el.classList.remove("enter");
+    void el.offsetWidth;
+    el.classList.add("enter");
+  }
+}
+function hide(el) { if (el) el.hidden = true; }
 
 function status(msg, isErr) {
   const s = $("#status");
   if (!msg) { hide(s); return; }
   s.textContent = msg;
   s.className = isErr ? "status err" : "status";
+  s.setAttribute("role", isErr ? "alert" : "status");
+  if (!isErr) s.setAttribute("aria-live", "polite"); else s.removeAttribute("aria-live");
   show(s);
 }
 
 // Send a command to the bridge; resolves with its "result" message.
-function send(cmd, extra, timeoutMs) {
+function send(cmd, extra, timeoutMs, onWorking) {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage(Object.assign({ to: "bridge", cmd }, extra || {}), (resp) => {
       if (chrome.runtime.lastError) { resolve({ ok: false, error: chrome.runtime.lastError.message }); return; }
       if (!resp || !resp.ok) { resolve({ ok: false, error: (resp && resp.error) || "Local helper is not reachable." }); return; }
       const id = resp.id;
-      const timer = setTimeout(() => {
+      const deadAnswer = () => {
         chrome.runtime.onMessage.removeListener(onMsg);
         resolve({ ok: false, error: "No answer from the local helper. Close and reopen the popup; if it repeats, run the installer again and restart your browser." });
-      }, timeoutMs || 15000);
+      };
+      let timer = setTimeout(deadAnswer, timeoutMs || 15000);
       function onMsg(m) {
+        // The helper is alive but still reading the page: extend the wait
+        // to its stated cap and update the status line.
+        if (m && m.umd && m.umd.id === id && m.umd.type === "probe-working") {
+          clearTimeout(timer);
+          timer = setTimeout(deadAnswer, ((m.umd.cap || 45) + 10) * 1000);
+          if (onWorking) { try { onWorking(m.umd); } catch (e) {} }
+          return;
+        }
         // Accept both "result" replies and "error" relays (e.g. the helper
         // disconnecting); silently dropping "error" hid real failures
         // behind the full timeout.
@@ -51,29 +72,79 @@ function send(cmd, extra, timeoutMs) {
   });
 }
 
+function qualityFromLabel(label) {
+  const m = /(\d{3,4}p(?:\s?60)?|\b\d{2,3}k\b|\b\d{2,3}\s?kbps\b|mp3)/i.exec(label || "");
+  return m ? m[1].replace(/\s+/g, "") : "";
+}
+
+function refreshDownloadButton() {
+  const btn = $("#download");
+  if (state.selected) {
+    btn.disabled = false;
+    const q = qualityFromLabel(state.selected.label);
+    $("#downtext").textContent = q ? "Download " + q : "Download";
+  } else {
+    btn.disabled = true;
+    $("#downtext").textContent = "Choose a format";
+  }
+}
+
+// The Download button always occupies its slot once options exist: disabled
+// ("Choose a format") until a row is selected, so the layout never jumps.
+function showActionBar() {
+  refreshDownloadButton();
+  show($("#actionbar"));
+}
+
 // Download progress / completion events.
 chrome.runtime.onMessage.addListener((m) => {
   const g = m && m.umd;
   if (!g || !state.job) return;
   if (g.job !== state.job.id) return;
   if (g.type === "progress") {
-    $("#fill").style.width = (g.pct || 0) + "%";
-    $("#ppct").textContent = g.pct != null ? Math.round(g.pct) + "%" : "";
-    $("#ptext").textContent =
-      (g.pct != null ? g.pct.toFixed(1) + "%" : "...") +
-      (g.speed ? " at " + g.speed : "") +
-      (g.eta ? " - ETA " + g.eta : "") +
-      (g.stage ? " - " + g.stage : "");
+    const pct = g.pct || 0;
+    $("#fill").style.width = pct + "%";
+    $("#fill").setAttribute("aria-valuenow", String(Math.round(pct)));
+    $("#ppct").textContent = g.pct != null ? g.pct.toFixed(1) + "%" : "";
+    $("#pspeed").textContent = g.speed || "\u2014";
+    $("#peta").textContent = g.eta || "\u2014";
+    const stageText = g.stage
+      ? g.stage.charAt(0).toUpperCase() + g.stage.slice(1) + "\u2026"
+      : "Downloading\u2026";
+    $("#pstage").textContent = stageText;
+    // the single glint runs only while the stage is "Downloading..."
+    $("#fill").classList.toggle("glint", stageText === "Downloading\u2026");
+    // announce progress at about 25% steps, not on every 0.1% tick
+    const bucket = Math.floor(pct / 25);
+    if (bucket !== state.announced) {
+      state.announced = bucket;
+      $("#pannounce").textContent = "Download " + Math.round(pct) + " percent";
+    }
   } else if (g.type === "done") {
-    hide($("#progress"));
-    $("#donetext").textContent = "Saved: " + (g.file || "file") + "  (Downloads/UMD)";
-    show($("#done"));
+    // one dealt moment: the bar fills to 100%, then the done card strokes in
+    $("#fill").style.width = "100%";
+    $("#fill").setAttribute("aria-valuenow", "100");
+    $("#fill").classList.remove("glint");
+    $("#ppct").textContent = "100.0%";
+    $("#pannounce").textContent = "Download complete";
+    const reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    setTimeout(() => {
+      hide($("#progress"));
+      $("#donetext").textContent = g.file || "file";
+      $("#donedir").textContent = state.downloadDir || "~/Downloads/UMD";
+      const d = $("#done");
+      d.classList.remove("checked");
+      show(d);
+      void d.offsetWidth;
+      d.classList.add("checked");
+    }, reduced ? 0 : 320);
     state.job = null;
   } else if (g.type === "error") {
     hide($("#progress"));
     status(g.error || "Download failed.", true);
     state.job = null;
-    show($("#download"));
+    // the Download button is restored as before (selection is kept)
+    showActionBar();
   }
 });
 
@@ -86,11 +157,20 @@ function fmtDur(sec) {
            : `${m}:${String(s).padStart(2, "0")}`;
 }
 
+// Middle-ellipsis for long paths; the full path stays in the title.
+function setPath(el, full) {
+  el.title = full;
+  if (full.length <= 34) { el.textContent = full; return; }
+  el.textContent = full.slice(0, 12) + "\u2026" + full.slice(-18);
+}
+
 function renderOptions() {
   const box = $("#options");
   box.innerHTML = "";
+  box.setAttribute("role", "radiogroup");
+  box.setAttribute("aria-label", "Formats");
   let lastKind = null;
-  for (const o of state.options) {
+  state.options.forEach((o, idx) => {
     if (o.kind !== lastKind) {
       lastKind = o.kind;
       const g = document.createElement("div");
@@ -100,9 +180,12 @@ function renderOptions() {
     }
     const row = document.createElement("div");
     row.className = "opt";
-    const radio = document.createElement("input");
-    radio.type = "radio";
-    radio.name = "fmt";
+    row.setAttribute("role", "radio");
+    row.setAttribute("aria-checked", "false");
+    row.tabIndex = idx === 0 ? 0 : -1;
+    const radio = document.createElement("span");
+    radio.className = "radio";
+    radio.setAttribute("aria-hidden", "true");
     const lab = document.createElement("span");
     lab.className = "lab";
     lab.textContent = o.label;
@@ -110,65 +193,100 @@ function renderOptions() {
     sz.className = "sz";
     sz.textContent = o.size || "";
     row.append(radio, lab, sz);
-    row.onclick = () => {
-      state.selected = o;
-      radio.checked = true;
-      box.querySelectorAll(".opt").forEach((r) => r.classList.remove("sel"));
-      row.classList.add("sel");
-      show($("#download"));
-    };
+    row.addEventListener("click", () => selectRow(box, row, o));
+    row.addEventListener("keydown", (e) => {
+      const rows = Array.from(box.querySelectorAll(".opt"));
+      const i = rows.indexOf(row);
+      if (e.key === "ArrowDown" || e.key === "ArrowRight") {
+        e.preventDefault();
+        const n = rows[(i + 1) % rows.length];
+        n.focus(); selectRow(box, n, n._opt);
+      } else if (e.key === "ArrowUp" || e.key === "ArrowLeft") {
+        e.preventDefault();
+        const p = rows[(i - 1 + rows.length) % rows.length];
+        p.focus(); selectRow(box, p, p._opt);
+      } else if (e.key === " " || e.key === "Enter") {
+        e.preventDefault();
+        selectRow(box, row, o);
+      }
+    });
+    row._opt = o;
     box.appendChild(row);
-  }
+  });
+}
+
+function selectRow(box, row, o) {
+  state.selected = o;
+  box.querySelectorAll(".opt").forEach((r) => {
+    r.classList.remove("sel");
+    r.setAttribute("aria-checked", "false");
+    r.tabIndex = -1;
+  });
+  row.classList.add("sel");
+  row.setAttribute("aria-checked", "true");
+  row.tabIndex = 0;
+  refreshDownloadButton();
 }
 
 async function doCheck(url) {
-  status("Reading link...", false);
-  hide($("#info")); $("#options").innerHTML = ""; hide($("#download")); hide($("#done")); hide($("#progress"));
-  const r = await send("probe", { url }, 13000);
+  status("Reading link\u2026", false);
+  hide($("#info")); $("#options").innerHTML = ""; hide($("#actionbar")); hide($("#done")); hide($("#progress"));
+  show($("#probe-skel"));
+  const r = await send("probe", { url }, 13000,
+    () => status("Still reading this page - this can take up to 45 seconds.", false));
+  hide($("#probe-skel"));
   if (!r.ok) { status(r.error || "Could not read that link.", true); return; }
   state.info = r.info; state.options = r.options; state.url = url;
+  state.selected = null;
   status("");
   $("#title").textContent = r.info.title || "Untitled media";
-  $("#meta").textContent = [r.info.site, r.info.uploader, fmtDur(r.info.duration)].filter(Boolean).join(" - ");
-  if (r.info.thumbnail) { $("#thumb").src = r.info.thumbnail; show($("#thumb")); } else hide($("#thumb"));
+  const dur = fmtDur(r.info.duration);
+  if (dur) { $("#durbadge").textContent = dur; show($("#durbadge")); } else hide($("#durbadge"));
+  $("#meta").textContent = [r.info.site, r.info.uploader].filter(Boolean).join(" \u00b7 ");
+  if (r.info.thumbnail) { $("#thumb").src = r.info.thumbnail; show($("#thumb")); } else { hide($("#thumb")); hide($("#durbadge")); }
   show($("#info"));
   if (!state.options.length) { status("The downloader found no downloadable formats on that page.", true); return; }
   renderOptions();
+  showActionBar();
   if (r.info.note) status(r.info.note, false);
 }
 
 // While a download runs, the picker controls step back and the progress
 // card takes over; the picker returns on error or on "New download".
 function setDownloading(on) {
-  ["#usetab", ".or", ".urlrow", "#info", "#options"].forEach((s) => { const el = $(s); if (el) el.hidden = on; });
+  ["#usetab", ".tabhint", ".or", ".urlgroup", ".saveto", "#info", "#options", "#actionbar"].forEach((s) => { const el = $(s); if (el) el.hidden = on; });
 }
 
 async function startDownload() {
   const o = state.selected;
   if (!o || !state.url) return;
-  hide($("#download")); hide($("#done"));
+  hide($("#actionbar")); hide($("#done"));
   setDownloading(true);
-  $("#ptitle").textContent = (state.info && state.info.title) || "Downloading";
-  $("#ppct").textContent = "";
+  state.announced = -1;
+  $("#ppct").textContent = "0.0%";
+  $("#pspeed").textContent = "\u2014"; $("#peta").textContent = "\u2014";
+  $("#pstage").textContent = "Starting\u2026";
+  $("#pannounce").textContent = "Download started";
   show($("#progress"));
   $("#fill").style.width = "0%";
-  $("#ptext").textContent = "Starting...";
+  $("#fill").setAttribute("aria-valuenow", "0");
+  $("#fill").classList.remove("glint");
   const r = await send("download", {
     url: state.url,
     kind: o.kind,
     selector: o.selector || "",
     mp3: o.mp3 || 0,
   });
-  if (!r.ok) { hide($("#progress")); setDownloading(false); status(r.error || "Download failed to start.", true); show($("#download")); return; }
+  if (!r.ok) { hide($("#progress")); setDownloading(false); status(r.error || "Download failed to start.", true); showActionBar(); return; }
   state.job = { id: r.job };
 }
 
-function setConn(state) {
+function setConn(s) {
   const p = $("#conn");
   if (!p) return;
-  p.classList.toggle("on", state === "on");
-  p.classList.toggle("off", state === "off");
-  p.innerHTML = "<i></i>" + (state === "on" ? "helper connected" : state === "off" ? "not connected" : "checking...");
+  p.classList.toggle("on", s === "on");
+  p.classList.toggle("off", s === "off");
+  p.innerHTML = "<i></i>" + (s === "on" ? "Helper connected" : s === "off" ? "Helper not connected" : "Checking helper\u2026");
 }
 
 async function boot() {
@@ -178,7 +296,7 @@ async function boot() {
     setConn("off");
     show($("#setup"));
     $("#setup-err").textContent = (st && st.error) ? ("(" + st.error + ")") : "";
-    $("#eng").textContent = "engine: not connected";
+    $("#eng").textContent = "not connected";
     return;
   }
   // The port connecting is not proof the helper works - require a real ping.
@@ -190,17 +308,23 @@ async function boot() {
     show($("#setup"));
     const why = ping.error || "helper connected but it did not answer";
     $("#setup-err").textContent = "(" + why + (why.indexOf("restart your browser") === -1 ? " - run the installer again, then restart your browser" : "") + ")";
-    $("#eng").textContent = "engine: not responding";
+    $("#eng").textContent = "not responding";
     return;
   }
   setConn("on");
   show($("#main"));
+  if (ping.download_dir) {
+    state.downloadDir = ping.download_dir;
+    setPath($("#saveto"), ping.download_dir);
+    $("#pdest").textContent = ping.download_dir;
+  }
 
-  // Footer engine info loads lazily; it must never block the UI.
+  // Footer engine info loads lazily; it must never block the UI and stays
+  // silent on failure.
   send("versions", null, 20000).then((v) => {
-    $("#eng").textContent = (v && v.ok && v.versions && v.versions.ytdlp)
-      ? "engine: yt-dlp " + v.versions.ytdlp
-      : "engine: connected (version check pending)";
+    if (v && v.ok && v.versions && v.versions.ytdlp) {
+      $("#eng").textContent = "yt-dlp " + v.versions.ytdlp;
+    }
   }).catch(() => {});
 
   // Re-attach to a running job if the popup was closed mid-download.
@@ -213,13 +337,19 @@ async function boot() {
   if (newest) {
     state.job = { id: newest.job };
     setDownloading(true);
-    $("#ptitle").textContent = "Download in progress";
+    $("#pstage").textContent = "Download in progress";
     show($("#progress"));
   }
 
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     const u = tabs && tabs[0] && tabs[0].url;
-    if (u && /^https?:\/\//.test(u)) $("#url").value = u;
+    if (u && /^https?:\/\//.test(u)) {
+      $("#url").value = u;
+      try {
+        $("#tabhint").textContent = new URL(u).hostname;
+        show($("#tabhint"));
+      } catch (e) {}
+    }
   });
 }
 
@@ -235,10 +365,19 @@ $("#download").onclick = startDownload;
 $("#cancel").onclick = () => { if (state.job) send("cancel", { job: state.job.id }); };
 $("#openfolder").onclick = () => send("open-downloads");
 $("#openfolder2").onclick = () => send("open-downloads");
-$("#again").onclick = () => { hide($("#done")); $("#options").innerHTML = ""; hide($("#info")); $("#url").value = ""; state.selected = null; setDownloading(false); $("#url").focus(); };
+$("#again").onclick = () => {
+  hide($("#done")); $("#options").innerHTML = "";
+  $("#url").value = ""; state.selected = null; state.announced = -1;
+  refreshDownloadButton();
+  setDownloading(false);
+  // setDownloading(false) restores the whole picker; the empty info card and
+  // the action bar stay down until a new probe fills them
+  hide($("#info")); hide($("#actionbar"));
+  $("#url").focus();
+};
 $("#update").onclick = async (e) => {
   e.preventDefault();
-  $("#eng").textContent = "engine: updating...";
+  $("#eng").textContent = "updating\u2026";
   const r = await send("update-engine");
   if (!r.ok) { $("#eng").textContent = "update failed to start"; return; }
   const jid = r.job;
@@ -247,7 +386,7 @@ $("#update").onclick = async (e) => {
     if (!g || g.job !== jid) return;
     if (g.type === "done") {
       chrome.runtime.onMessage.removeListener(onMsg);
-      $("#eng").textContent = "engine: yt-dlp " + (g.version || "?") + (g.note === "already latest" ? " (already latest)" : "");
+      $("#eng").textContent = "yt-dlp " + (g.version || "?") + (g.note === "already latest" ? " (already latest)" : "");
     } else if (g.type === "error") {
       chrome.runtime.onMessage.removeListener(onMsg);
       $("#eng").textContent = "update failed - current version kept";
@@ -257,10 +396,10 @@ $("#update").onclick = async (e) => {
 };
 $("#closex").onclick = () => window.close();
 
-// ---- panel silhouette + traveling border light ---------------------------
-// Same shape recipe as the in-page menu's card (raised top-right tab), and
-// the same SVG rim; the blue light is a short dash traveling the outline.
-const PANEL_TAB_W = 132, PANEL_RISE = 30, PANEL_SHOULDER = 34, PANEL_R = 20, PANEL_TAB_R = 13;
+// ---- panel silhouette -------------------------------------------------------
+// Same shape recipe as the in-page menu's card (raised top-right tab); the
+// rim is one static 1px gradient stroke with a small soft glow.
+const PANEL_TAB_W = 170, PANEL_RISE = 30, PANEL_SHOULDER = 34, PANEL_R = 20, PANEL_TAB_R = 13;
 
 function panelShape(W, H) {
   const R = PANEL_R, T = PANEL_TAB_R, tw = PANEL_TAB_W, y0 = PANEL_RISE, sh = PANEL_SHOULDER;
@@ -289,25 +428,6 @@ function panelShape(W, H) {
   };
 }
 
-const LIGHT_SEGS = [
-  ["umd-p-glow", 0.16],
-  ["umd-p-body", 0.11],
-  ["umd-p-head", 0.025],
-];
-let lightLen = 0;
-let lightNow = 0;
-const LIGHT_PERIOD = 5200;
-
-function lightFrame(now) {
-  lightNow = now;
-  if (!lightLen) return;
-  const off = ((now % LIGHT_PERIOD) / LIGHT_PERIOD) * lightLen;
-  for (const [id] of LIGHT_SEGS) {
-    const el = document.getElementById(id);
-    if (el) el.setAttribute("stroke-dashoffset", (-off).toFixed(1));
-  }
-}
-
 function bakePanel() {
   const p = $("#panel");
   if (!p) return;
@@ -317,40 +437,19 @@ function bakePanel() {
   p._baked = W + "x" + H;
   const shape = panelShape(W, H);
   p.style.clipPath = "polygon(" + shape.clip + ")";
+  // one static 1px gradient rim
   $("#glassrim").innerHTML =
     '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">' +
     '<defs><linearGradient id="umdPRimG" x1="0" y1="0" x2="1" y2="1">' +
-    '<stop offset="0" stop-color="rgba(255,255,255,.98)"/>' +
-    '<stop offset=".22" stop-color="rgba(255,255,255,.28)"/>' +
-    '<stop offset=".5" stop-color="rgba(185,212,255,.40)"/>' +
-    '<stop offset=".72" stop-color="rgba(255,255,255,.22)"/>' +
-    '<stop offset=".88" stop-color="rgba(198,222,255,.64)"/>' +
-    '<stop offset="1" stop-color="rgba(255,255,255,.92)"/></linearGradient></defs>' +
-    '<polygon points="' + shape.ptsAttr + '" fill="none" stroke="rgba(255,255,255,.16)" stroke-width="4.5" stroke-linejoin="round"/>' +
-    '<polygon points="' + shape.ptsAttr + '" fill="none" stroke="url(#umdPRimG)" stroke-width="1.8" stroke-linejoin="round"/>' +
-    '<polygon id="umd-p-glow" points="' + shape.ptsAttr + '" fill="none" stroke="#2f7dff" stroke-width="6" stroke-opacity=".45" stroke-linejoin="round" stroke-linecap="round"/>' +
-    '<polygon id="umd-p-body" points="' + shape.ptsAttr + '" fill="none" stroke="#66b3ff" stroke-width="2.2" stroke-opacity=".9" stroke-linejoin="round" stroke-linecap="round"/>' +
-    '<polygon id="umd-p-head" points="' + shape.ptsAttr + '" fill="none" stroke="#eaf5ff" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"/>' +
+    '<stop offset="0" stop-color="rgba(255,255,255,.85)"/>' +
+    '<stop offset=".25" stop-color="rgba(255,255,255,.22)"/>' +
+    '<stop offset=".55" stop-color="rgba(185,212,255,.28)"/>' +
+    '<stop offset=".8" stop-color="rgba(255,255,255,.18)"/>' +
+    '<stop offset="1" stop-color="rgba(255,255,255,.7)"/></linearGradient></defs>' +
+    '<polygon points="' + shape.ptsAttr + '" fill="none" stroke="url(#umdPRimG)" stroke-width="1" stroke-linejoin="round"/>' +
     '</svg>';
-  const glow = document.getElementById("umd-p-glow");
-  lightLen = glow.getTotalLength();
-  for (const [id, f] of LIGHT_SEGS) {
-    const el = document.getElementById(id);
-    el.setAttribute("stroke-dasharray", (lightLen * f).toFixed(1) + " " + (lightLen * (1 - f)).toFixed(1));
-  }
-  // a rebuild drops the animated dashoffset with the old SVG; re-apply it
-  lightFrame(lightNow);
 }
 
 new ResizeObserver(() => bakePanel()).observe($("#panel"));
 
-if (window.__umdLightFreeze != null) {
-  // test hook: render one fixed light position instead of animating
-  bakePanel();
-  lightFrame(window.__umdLightFreeze);
-} else {
-  requestAnimationFrame(function loop(now) { lightFrame(now); requestAnimationFrame(loop); });
-}
-
 boot();
-
