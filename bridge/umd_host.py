@@ -41,6 +41,7 @@ if os.name == "nt":
     import msvcrt
     msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
     msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+import shutil
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
@@ -48,7 +49,8 @@ from urllib.parse import urlparse
 BASE = Path(__file__).resolve().parent.parent
 BIN = BASE / "bin"
 YTDLP = BIN / "yt-dlp"
-DL_DIR = Path.home() / "Downloads" / "UMD"
+DL_DIR = Path.home() / "Downloads"
+TMP_DIR = BASE / "song-tmp"
 LOG = Path(__file__).resolve().parent / "bridge.log"
 
 RELEASE_API = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
@@ -150,6 +152,16 @@ def base_args():
     return args
 
 
+def extra_headers(url):
+    """Sites that refuse bare requests get a plain browser-style Referer."""
+    h = (urlparse(url).hostname or "").lower()
+    if h.endswith("reddit.com") or h.endswith("redd.it") or h.endswith("redditmedia.com"):
+        return ["--add-header", "Referer:https://www.reddit.com/"]
+    if h.endswith("cdninstagram.com") or h.endswith("fbcdn.net") or h.endswith("instagram.com"):
+        return ["--add-header", "Referer:https://www.instagram.com/"]
+    return []
+
+
 def friendly_error(stderr_text):
     lines = [l for l in clean(stderr_text).splitlines() if l.strip()]
     msg = lines[-1] if lines else "The downloader could not read that page."
@@ -158,6 +170,9 @@ def friendly_error(stderr_text):
     if any(k in low for k in ("login", "sign in", "cookies", "log in", "private")):
         return ("This page needs a site login. The helper only fetches public "
                 "content, so this one is not downloadable.")
+    if "403" in low or "blocked" in low or "429" in low:
+        return ("The site refused the request (blocked or rate-limited). "
+                "Wait a minute and try again.")
     if "unsupported url" in low:
         return "This site is not supported by the downloader."
     if "drm" in low:
@@ -415,7 +430,7 @@ def do_probe(rid, url):
                   "error": "The helper is busy reading another page. Give it a few seconds, then try again."})
             return
         try:
-            proc = subprocess.Popen(base_args() + ["-J", "--", url],
+            proc = subprocess.Popen(base_args() + extra_headers(url) + ["-J", "--", url],
                                     stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True)
         except Exception as e:
@@ -452,18 +467,29 @@ STALE_SOURCE_RE = re.compile(
     r"(unable to download video data|Got error): HTTP Error (403|404|410)")
 
 
-def run_download(rid, url, kind, selector, mp3):
+def run_download(rid, url, kind, selector, mp3, name=""):
     proc = None
     try:
         DL_DIR.mkdir(parents=True, exist_ok=True)
-        args = base_args() + [
+        # Use unique template with timestamp to avoid conflicts
+        import time
+        timestamp = int(time.time() * 1000) % 100000  # Last 5 digits of ms timestamp
+        tmpl = "%(title).80B [%(id)s]_" + str(timestamp) + ".%(ext)s"
+        if name:
+            tmpl = name + "_" + str(timestamp) + ".%(ext)s"
+        args = base_args() + extra_headers(url) + [
             "--newline", "--paths", str(DL_DIR),
-            "-o", "%(title).120B [%(id)s].%(ext)s"]
+            "--no-overwrites",
+            "--restrict-filenames",
+            "-o", tmpl]
         if kind == "video":
-            args += ["-f", selector, "--merge-output-format", "mp4/mkv/webm"]
+            args += ["-f", selector or "bv*+ba/b", "--merge-output-format", "mp4/mkv/webm"]
         elif kind == "audio-mp3":
             args += ["-f", "ba/b", "--extract-audio",
                      "--audio-format", "mp3", "--audio-quality", "%dK" % mp3]
+        elif kind == "image":
+            # For images, just download the file directly without format selection
+            args += ["-f", "b"]
         else:
             args += ["-f", "ba/b"]
 
@@ -577,17 +603,22 @@ def run_download(rid, url, kind, selector, mp3):
             return
         if r["ret"] == 0:
             name = None
+            final_path = None
             if r["final"]:
                 pth = Path(r["final"])
                 if pth.exists():
                     name = pth.name
+                    final_path = str(pth)
             if not name:
                 try:
                     newest = max(DL_DIR.iterdir(), key=lambda p: p.stat().st_mtime)
                     name = newest.name
+                    final_path = str(newest)
                 except Exception:
                     name = "file"
-            send({"type": "done", "job": rid, "file": name, "ts": time.time()})
+            # Serve the file so Chrome can download it
+            url = serve_once(final_path) if final_path else None
+            send({"type": "done", "job": rid, "file": name, "path": final_path, "url": url, "ts": time.time()})
         else:
             if job_cancelled() or (r["ret"] is not None and r["ret"] < 0):
                 send({"type": "error", "job": rid, "error": "Cancelled."})
@@ -616,7 +647,8 @@ def do_download(rid, msg):
     kind = msg.get("kind")
     selector = msg.get("selector") or ""
     mp3 = msg.get("mp3") or 0
-    if kind not in ("video", "audio", "audio-mp3"):
+    name = re.sub(r'[\\/:*?"<>|%\x00-\x1f]', "_", str(msg.get("name") or "")).strip(" .")[:100]
+    if kind not in ("video", "audio", "audio-mp3", "image"):
         send({"id": rid, "type": "result", "ok": False, "error": "Unknown download type."})
         return
     # Audio always needs FFmpeg (MP3 conversion); a "+" selector nearly
@@ -644,7 +676,179 @@ def do_download(rid, msg):
             return
     send({"id": rid, "type": "result", "ok": True, "job": rid})
     threading.Thread(target=run_download,
-                     args=(rid, url, kind, selector, mp3), daemon=True).start()
+                     args=(rid, url, kind, selector, mp3, name), daemon=True).start()
+
+
+def serve_once(path):
+    """Serve one file once on 127.0.0.1 behind a random token so Chrome's own
+    download manager can fetch it. Returns the URL, or None on failure.
+    The file is NOT deleted after serving, so users can find it in the Downloads folder."""
+    try:
+        import http.server, secrets, urllib.parse, mimetypes
+        token = secrets.token_urlsafe(24)
+        fp = Path(path)
+
+        # Guess MIME type from file extension
+        mime_type, _ = mimetypes.guess_type(fp.name)
+        if not mime_type:
+            mime_type = "application/octet-stream"
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if self.path != "/" + token:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", mime_type)
+                self.send_header("Content-Length", str(fp.stat().st_size))
+                self.send_header("Content-Disposition",
+                                 "attachment; filename*=UTF-8''" + urllib.parse.quote(fp.name))
+                self.end_headers()
+                with open(fp, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                # File is kept in Downloads folder for user access
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        srv.timeout = 120
+
+        def run():
+            try:
+                srv.handle_request()
+            finally:
+                srv.server_close()
+        threading.Thread(target=run, daemon=True).start()
+        return "http://127.0.0.1:%d/%s" % (srv.server_address[1], token)
+    except Exception as e:
+        log("serve_once failed: %r" % e)
+        return None
+
+
+SONG_AUDIO_SOURCES = [
+    ("YouTube", "ytsearch10:%s official audio"),
+    ("YouTube (lyrics)", "ytsearch10:%s lyrics"),
+    ("YouTube Music", "ytsearch10:%s"),
+    ("SoundCloud", "scsearch10:%s"),
+    ("Bilibili", "bilisearch10:%s"),
+]
+SONG_VIDEO_SOURCES = [
+    ("YouTube", "ytsearch10:%s official video"),
+    ("YouTube (music video)", "ytsearch10:%s music video"),
+    ("YouTube", "ytsearch10:%s"),
+    ("Bilibili", "bilisearch10:%s"),
+]
+MEDIA_EXT = (".mp3", ".mp4", ".mkv", ".webm", ".m4a")
+
+
+def run_song(rid, query, title, kind="audio-mp3", mp3=320, height=720):
+    try:
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        words = re.findall(r"\w+", title or "", re.U)[:4]
+        # Don't filter by duration - some official audio tracks might be longer
+        flt = ""
+        if words:
+            flt = "title~=(?i)" + ".*".join(re.escape(w) for w in words)
+        sources = SONG_VIDEO_SOURCES if kind == "video" else SONG_AUDIO_SOURCES
+        if kind == "video":
+            fmt = ["-f", "bv*[height<=%d]+ba/b[height<=%d]/b" % (height, height),
+                   "--merge-output-format", "mp4/mkv"]
+        else:
+            fmt = ["-f", "ba/b", "--extract-audio", "--audio-format", "mp3",
+                   "--audio-quality", "%dK" % mp3]
+        last_err = "No source had this song."
+        for label, tmpl in sources:
+            with _jobs_lock:
+                if (_jobs.get(rid) or {}).get("cancelled"):
+                    send({"type": "error", "job": rid, "error": "Cancelled."})
+                    return
+            send({"type": "progress", "job": rid, "pct": 0.0,
+                  "stage": "searching " + label, "ts": time.time()})
+            args = base_args() + [
+                "--newline", "--paths", str(TMP_DIR),
+                "-o", "%(title).120B.%(ext)s",
+                "--max-downloads", "1"] + fmt + [
+                "--print", "after_move:filepath",
+                "--", tmpl % query]
+            if flt:
+                args.insert(-2, "--match-filter")
+                args.insert(-1, flt)
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True)
+            with _jobs_lock:
+                _active_procs[rid] = proc
+                _jobs.setdefault(rid, {"state": "running"})
+            final, tail = None, []
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                tail.append(line)
+                del tail[:-8]
+                if line.startswith(str(TMP_DIR)) and line.lower().endswith(MEDIA_EXT):
+                    final = line.strip()
+                    continue
+                m = PCT.search(line)
+                if m:
+                    sp = SPEED.search(line)
+                    et = ETA.search(line)
+                    send({"type": "progress", "job": rid,
+                          "pct": min(float(m.group(1)), 99.0),
+                          "speed": sp.group(1) if sp else "",
+                          "eta": et.group(1) if et else "",
+                          "stage": label, "ts": time.time()})
+                elif "[ExtractAudio]" in line or "[Merger]" in line:
+                    send({"type": "progress", "job": rid, "pct": 99.0,
+                          "stage": "finishing", "ts": time.time()})
+            proc.wait()
+            if proc.returncode is not None and proc.returncode < 0:
+                send({"type": "error", "job": rid, "error": "Cancelled."})
+                return
+            if proc.returncode in (0, 101) and final and Path(final).exists():
+                url = serve_once(final)
+                # File stays in UMD folder (TMP_DIR which is under UMD)
+                log("song saved: %s" % final)
+                send({"type": "done", "job": rid, "file": Path(final).name,
+                      "path": final, "url": url, "source": label, "ts": time.time()})
+                return
+            last_err = friendly_error("\n".join(tail))
+            log("song source %s failed: %s" % (label, last_err))
+        send({"type": "error", "job": rid,
+              "error": "All sources failed. Last error: " + last_err})
+    except Exception as e:
+        log("song error: %r" % e)
+        send({"type": "error", "job": rid, "error": "The download stopped unexpectedly."})
+    finally:
+        with _jobs_lock:
+            _active_procs.pop(rid, None)
+            _jobs.pop(rid, None)
+
+
+def do_song(rid, msg):
+    q = re.sub(r"\s+", " ", str(msg.get("query") or "")).strip().lstrip("-")[:200]
+    title = re.sub(r"\s+", " ", str(msg.get("title") or "")).strip()[:150]
+    kind = "video" if msg.get("kind") == "video" else "audio-mp3"
+    mp3 = msg.get("mp3") if msg.get("mp3") in (128, 192, 256, 320) else 320
+    height = msg.get("height") if msg.get("height") in (360, 480, 720, 1080, 1440, 2160) else 720
+    if len(q) < 2:
+        send({"id": rid, "type": "result", "ok": False, "error": "No song name."})
+        return
+    if not ffmpeg_present():
+        send({"id": rid, "type": "result", "ok": False,
+              "error": "FFmpeg is missing. Re-run the setup script."})
+        return
+    with _jobs_lock:
+        if len(_active_procs) >= MAX_CONCURRENT:
+            send({"id": rid, "type": "result", "ok": False,
+                  "error": "Too many downloads are already running."})
+            return
+        _jobs[rid] = {"state": "running"}
+    send({"id": rid, "type": "result", "ok": True, "job": rid})
+    threading.Thread(target=run_song, args=(rid, q, title, kind, mp3, height),
+                     daemon=True).start()
 
 
 def do_cancel(rid, msg):
@@ -798,6 +1002,8 @@ def main():
                           "error": "That does not look like a valid web link."})
                 else:
                     do_download(rid, req)
+            elif cmd == "song":
+                do_song(rid, req)
             elif cmd == "cancel":
                 do_cancel(rid, req)
             elif cmd == "open-downloads":

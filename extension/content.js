@@ -21,10 +21,12 @@
     { re: /(^|\.)soundcloud\.com$/, name: "SoundCloud", accent: "#ff5500" },
     { re: /(^|\.)streamable\.com$/, name: "Streamable", accent: "#0f90fa" },
     { re: /(^|\.)ted\.com$/, name: "TED", accent: "#e62b1e" },
+    { re: /^open\.spotify\.com$/, name: "Spotify", accent: "#1db954" },
   ];
   const host = (location.hostname || "").toLowerCase();
   const site = SITES.find((s) => s.re.test(host)) ||
     { name: host.replace(/^www\./, ""), accent: "#4f8cff" };
+  const SPOTIFY = host === "open.spotify.com";
   const isYTWatch = /(^|\.)youtube\.com$/.test(host) && location.pathname === "/watch";
 
   // ------------------------------------------------------- bridge messaging
@@ -1029,17 +1031,149 @@
       if (/(^|\.)soundcloud\.com$/.test(h)) return /^\/[^/]+\/[^/]+/.test(p);
       if (/(^|\.)streamable\.com$/.test(h)) return /^\/[^/]{3,}\/?$/.test(p);
       if (/(^|\.)ted\.com$/.test(h)) return p.startsWith("/talks/");
+      if (h === "open.spotify.com") return true;
       return true; // any other supported host: let the URL try first
     } catch (e) { return true; }
   }
   // Probe results live until the tab moves to a different video. Reopening
   // the pill on the same page reads this instead of re-probing, and the
   // prefetch below lands here too, so the first click is usually instant.
+  // ------------------------------------------------ in-browser media resolvers
+  // Instagram and Reddit refuse the engine's anonymous requests. The page
+  // itself is logged in and same-origin, so it reads the media links and the
+  // helper only has to fetch plain files / playlists. Any failure here falls
+  // back to the helper reading the page URL itself.
+  const IG_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  function igMediaId(code) {
+    let n = 0n;
+    for (const c of code.slice(0, 11)) {
+      const i = IG_ALPHA.indexOf(c);
+      if (i < 0) return null;
+      n = n * 64n + BigInt(i);
+    }
+    return n.toString();
+  }
+  const MP3_RATES = [320, 256, 192, 128];
+  async function igResolve(url) {
+    const m = new URL(url).pathname.match(/^\/(?:[^/]+\/)?(?:p|reel|reels|tv)\/([\w-]+)/);
+    const id = m && igMediaId(m[1]);
+    if (!id) return null;
+    const r = await fetch("/api/v1/media/" + id + "/info/", {
+      credentials: "include",
+      headers: { "X-IG-App-ID": "936619743392459", "X-Requested-With": "XMLHttpRequest" },
+    });
+    if (!r.ok) return null;
+    const top = (((await r.json()).items) || [])[0];
+    if (!top) return null;
+    const vid = top.video_versions ? top : (top.carousel_media || []).find((c) => c.video_versions);
+    if (!vid || !vid.video_versions.length) return null;
+    const byH = new Map();
+    vid.video_versions.forEach((v) => {
+      const h = Math.min(v.width || 0, v.height || 0);
+      const cur = byH.get(h);
+      if (!cur || (v.width * v.height) > (cur.width * cur.height)) byH.set(h, v);
+    });
+    const heights = [...byH.keys()].sort((a, b) => b - a);
+    const best = byH.get(heights[0]);
+    // Strip query parameters from URLs to avoid filename too long errors
+    const cleanUrl = (u) => u.split("?")[0];
+    const options = [{ id: "v-best", kind: "video", label: "Best available (auto)", selector: "b", url: cleanUrl(best.url) }];
+    heights.forEach((h) => options.push({ id: "v" + h, kind: "video", label: (h ? h + "p" : "Video"), selector: "b", url: cleanUrl(byH.get(h).url) }));
+    MP3_RATES.forEach((br) => options.push({ id: "a" + br, kind: "audio-mp3", label: "MP3 " + br + " kbps", mp3: br, url: cleanUrl(best.url) }));
+    const cap = (top.caption && top.caption.text || "").replace(/\s+/g, " ").trim();
+    const user = (top.user && top.user.username) || "";
+    const cand = vid.image_versions2 && vid.image_versions2.candidates && vid.image_versions2.candidates[0];
+    return { ok: true, resolvedUrl: url, useName: true, options,
+      info: { title: cap.slice(0, 90) || (user ? user + " - Instagram video" : "Instagram video"),
+              uploader: user ? "@" + user : "", site: "Instagram",
+              thumbnail: cand ? cand.url : "", duration: vid.video_duration || 0 } };
+  }
+  async function redditResolve(url, timeoutMs, onWorking) {
+    const u = new URL(url);
+    if (u.hostname !== location.hostname || !/\/comments\/\w+/.test(u.pathname)) return null;
+    const r = await fetch(u.origin + u.pathname.replace(/\/?$/, "/") + ".json?raw_json=1",
+      { credentials: "include", headers: { Accept: "application/json" } });
+    if (!r.ok) return null;
+    let post = (((await r.json())[0] || {}).data || {}).children;
+    post = post && post[0] && post[0].data;
+    if (!post) return null;
+    if (!post.secure_media && !post.media && post.crosspost_parent_list && post.crosspost_parent_list[0]) post = post.crosspost_parent_list[0];
+
+    const prev = post.preview && post.preview.images && post.preview.images[0];
+    const thumb = (prev && prev.source && prev.source.url) || (/^http/.test(post.thumbnail || "") ? post.thumbnail : "");
+    const info = { title: post.title || "Reddit post", site: "Reddit", thumbnail: thumb, duration: 0,
+                   uploader: ["r/" + post.subreddit, post.author ? "u/" + post.author : ""].filter(Boolean).join(" \u00b7 ") };
+
+    // Check if it's an image post (url_overridden_by_dest or url pointing to an image)
+    const mediaUrl = post.url_overridden_by_dest || post.url;
+    if (mediaUrl && /\.(jpg|jpeg|png|webp)(\?|$)/i.test(mediaUrl)) {
+      return { ok: true, resolvedUrl: url, useName: true, info,
+        options: [{ id: "img-direct", kind: "image", label: "Image (HD)", selector: "b", url: mediaUrl.split("?")[0] }] };
+    }
+
+    const rv = (post.secure_media && post.secure_media.reddit_video) ||
+               (post.media && post.media.reddit_video) ||
+               (post.preview && post.preview.reddit_video_preview);
+    if (!rv) return null;
+
+    info.duration = rv.duration || 0;
+    if (rv.hls_url) {
+      const pr = await send("probe", { url: rv.hls_url }, timeoutMs, onWorking);
+      if (pr && pr.ok && (pr.options || []).length) {
+        return Object.assign({}, pr, { info: Object.assign({}, pr.info, info), resolvedUrl: rv.hls_url, useName: true });
+      }
+    }
+    if (rv.fallback_url) { // silent clip / GIF: one plain mp4
+      const h = rv.height || 0;
+      return { ok: true, resolvedUrl: url, useName: true, info,
+        options: [{ id: "v-direct", kind: "video", label: (h ? h + "p" : "Video") + " (no audio track)", selector: "b", url: rv.fallback_url.split("?")[0] }] };
+    }
+    return null;
+  }
+  async function probeVia(url, timeoutMs, onWorking) {
+    try {
+      const h = new URL(url).hostname;
+      // For Instagram, let the bridge handle it natively with yt-dlp
+      // yt-dlp has built-in Instagram extractors that handle authentication properly
+      // The igResolve() approach extracts direct CDN URLs that require cookies and fail with 403
+      if (/(^|\.)instagram\.com$/.test(h) && h === location.hostname) {
+        // Fall through to bridge's probe (send "probe" command)
+      } else if (/(^|\.)reddit\.com$/.test(h)) {
+        const r = await redditResolve(url, timeoutMs, onWorking);
+        if (r) return r;
+      }
+    } catch (e) { /* fall through to the helper */ }
+    return send("probe", { url }, timeoutMs, onWorking);
+  }
+
+  // ------------------------------------------------------------ Spotify track
+  // The track's own page carries clean title/artist/cover meta tags.
+  async function spGetTrack() {
+    const a = document.querySelector('[data-testid="now-playing-widget"] a[href*="/track/"], footer a[href*="/track/"]');
+    const m = ((a && a.getAttribute("href")) || location.pathname).match(/\/track\/(\w+)/);
+    if (m) {
+      try {
+        const r = await fetch("/track/" + m[1], { credentials: "omit" });
+        const doc = new DOMParser().parseFromString(await r.text(), "text/html");
+        const meta = (p) => { const e = doc.querySelector('meta[property="' + p + '"]'); return e ? (e.content || "").trim() : ""; };
+        const title = meta("og:title");
+        if (title) return { title, thumb: meta("og:image"),
+          artist: (meta("og:description").split(" \u00b7 ")[0] || "").split(",")[0].trim() };
+      } catch (e) {}
+    }
+    try {
+      const md = navigator.mediaSession && navigator.mediaSession.metadata;
+      if (md && md.title) return { title: md.title, artist: (md.artist || "").split(",")[0].trim(),
+        thumb: (md.artwork && md.artwork.length) ? md.artwork[md.artwork.length - 1].src : "" };
+    } catch (e) {}
+    return null;
+  }
+
   const probeCache = new Map(); // mediaKey -> { url, info, options }
   let inflightProbe = null; // { key, promise } - a prefetch still in flight
   function cacheProbe(url, r) {
     if (!r || !r.ok || !(r.options || []).length) return;
-    probeCache.set(mediaKey(url), { url, info: r.info || {}, options: r.options || [] });
+    probeCache.set(mediaKey(url), { url: r.resolvedUrl || url, useName: !!r.useName, info: r.info || {}, options: r.options || [] });
     // Entries for pages already left can never be served (lookups are keyed
     // by the page being probed); drop them so the cache stays one-video deep.
     const keep = mediaKey(location.href);
@@ -1053,13 +1187,13 @@
   // Failures are silent here - the menu's own probe reports errors when it runs.
   let pageProbeSent = false;
   function prefetchProbe() {
-    if (pageProbeSent) return;
+    if (pageProbeSent || SPOTIFY) return;
     if (targetOverride && targetOverride.unresolved) return; // nothing to warm
     const url = (targetOverride && targetOverride.url) || location.href;
     if (probeCache.has(mediaKey(url))) return; // already warm
     if (inflightProbe && inflightProbe.key === mediaKey(url)) return; // probing now
     pageProbeSent = true;
-    inflightProbe = { key: mediaKey(url), promise: send("probe", { url }, 60000)
+    inflightProbe = { key: mediaKey(url), promise: probeVia(url, 60000)
       .then((r) => { if (r && r.ok) cacheProbe(url, r); return r; })
       .catch(() => { pageProbeSent = false; return null; }) }; // retry later
   }
@@ -1447,7 +1581,7 @@
       if (up) left.appendChild(el("div", "umd-uploader", up));
 
       const right = el("div", "umd-right");
-      right.appendChild(el("div", "umd-label", "Quality / type"));
+      right.appendChild(el("div", "umd-label", "Format"));
       const selWrap = el("div", "umd-selectwrap");
       const sel = document.createElement("select");
       sel.className = "umd-quality";
@@ -1469,14 +1603,13 @@
       const save = el("div", "umd-save");
       save.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
         '<path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="#8fb8ff" stroke-width="1.7" stroke-linejoin="round"/></svg>';
-      save.appendChild(el("span", "", "Saves to " + st.downloadDir));
       right.appendChild(save);
 
       main.append(left, right);
       body.appendChild(main);
 
       const dl = primaryBtn("Download", () => startDownload(sel));
-      renderFoot(st.options.length + " formats found", [ghostBtn("Cancel", close), dl]);
+      renderFoot("", [ghostBtn("Cancel", close), dl]);
       dl.focus({ focusVisible: false }); // autofocus for Enter-to-download without showing the ring; the styled :focus-visible ring still appears on real Tab navigation
     }
 
@@ -1501,15 +1634,13 @@
       const stats = el("div", "umd-stats");
       stats.innerHTML =
         '<div class="umd-stat"><div class="k">Speed</div><div class="v" id="umd-speed">\u2014</div></div>' +
-        '<div class="umd-stat"><div class="k">ETA</div><div class="v" id="umd-eta">\u2014</div></div>' +
-        '<div class="umd-stat"><div class="k">Saving to</div><div class="v" style="font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" id="umd-dest">' +
-        st.downloadDir.replace(/</g, "&lt;") + "</div></div>";
+        '<div class="umd-stat"><div class="k">ETA</div><div class="v" id="umd-eta">\u2014</div></div>';
       w.append(row, bar, stats);
       body.appendChild(w);
-      renderFoot("", [ghostBtn("Cancel download", cancelJob)]);
+      renderFoot("", [ghostBtn("Cancel", cancelJob)]);
     }
 
-    function showDone(file) {
+    function showDone(file, filePath) {
       st.phase = "done";
       setPasteEnabled(true);
       body.innerHTML = "";
@@ -1524,11 +1655,38 @@
       li.src = faviconUrl(); li.alt = site.name; li.onerror = () => li.remove();
       lg.appendChild(li);
       cw.append(ring, lg);
-      w.append(cw, el("div", "umd-donetitle", "Download complete"),
-               el("div", "umd-donefile", file || "Saved to " + st.downloadDir));
+
+      // Show file name
+      w.append(cw, el("div", "umd-donetitle", "Download complete"));
+
+      // Show file path if available
+      if (filePath) {
+        const pathDiv = el("div", "umd-donefile");
+        pathDiv.style.fontSize = "12px";
+        pathDiv.style.color = "var(--text2)";
+        pathDiv.style.marginTop = "4px";
+        pathDiv.style.maxWidth = "480px";
+        pathDiv.style.overflow = "hidden";
+        pathDiv.style.textOverflow = "ellipsis";
+        pathDiv.style.whiteSpace = "nowrap";
+        // Show just the filename with folder indicator
+        const filename = filePath.split("/").pop() || filePath;
+        pathDiv.textContent = "📁 ~/Downloads/" + filename;
+        pathDiv.title = filePath; // Full path on hover
+        w.append(pathDiv);
+      } else if (file) {
+        w.append(el("div", "umd-donefile", "📁 ~/Downloads/" + file));
+      } else {
+        w.append(el("div", "umd-donefile", "Saved to " + st.downloadDir));
+      }
+
       body.appendChild(w);
-      renderFoot("Closing\u2026", [ghostBtn("Close now", close)]);
-      setTimeout(() => { if (st.phase === "done") close(); }, 3400);
+      renderFoot("", [
+        primaryBtn("Open Folder", () => send("open-downloads")),
+        ghostBtn("Show in Chrome", () => chrome.runtime.sendMessage({ to: "bridge", cmd: "open-downloads-tab" })),
+        ghostBtn("Close", close)
+      ]);
+      // Don't auto-close - let user decide when to close
     }
 
     // ---- actions
@@ -1541,10 +1699,30 @@
     async function startDownload(sel) {
       const o = st.options[Number(sel.value)];
       if (!o) return;
+
+      // For Spotify, ensure we have the track info before downloading
+      if (SPOTIFY && !st.spQuery) {
+        const t = await spGetTrack();
+        if (t) {
+          st.spQuery = (t.artist ? t.artist + " " : "") + t.title;
+          st.spTitle = t.title;
+        }
+      }
+
+      // Ensure we have a query for Spotify
+      if (SPOTIFY && !st.spQuery) {
+        showError("Could not identify the playing track. Play a song and try again.");
+        return;
+      }
+
       showProgress();
-      const r = await send("download", {
-        url: st.url || location.href, kind: o.kind, selector: o.selector || "", mp3: o.mp3 || 0,
-      });
+      const r = SPOTIFY
+        ? await send("song", { query: st.spQuery, title: st.spTitle,
+            kind: o.kind === "video" ? "video" : "audio-mp3", mp3: o.mp3 || 0, height: o.height || 0 })
+        : await send("download", {
+            url: o.url || st.url || location.href, kind: o.kind, selector: o.selector || "", mp3: o.mp3 || 0,
+            name: st.useName ? ((st.info && st.info.title) || "") : "",
+          });
       if (!r.ok) { showError(r.error || "Download failed to start."); return; }
       st.job = { id: r.job };
     }
@@ -1563,7 +1741,8 @@
           : "Downloading\u2026";
       } else if (g.type === "done") {
         st.job = null;
-        showDone(g.file);
+        showDone(g.file, g.path);
+        if (g.url) chrome.runtime.sendMessage({ to: "save-file", url: g.url, name: g.file });
       } else if (g.type === "error") {
         st.job = null;
         if (st.phase === "downloading") showError(g.error || "Download failed.");
@@ -1585,7 +1764,7 @@
       }
       if (my !== probeSeq) return; // superseded by a newer probe
       if (!r) {
-        const p = send("probe", { url }, 13000, () => {
+        const p = probeVia(url, 13000, () => {
           if (my !== probeSeq) return; // a newer probe owns the card now
           const lt = shadow.querySelector(".umd-loadtext");
           if (lt) lt.textContent = isPage
@@ -1602,7 +1781,8 @@
         showError(r.error || "Could not read that link.");
         return;
       }
-      st.url = url;
+      st.url = r.resolvedUrl || url;
+      st.useName = !!r.useName;
       st.urlIsPage = !!isPage;
       st.info = r.info || {};
       st.options = r.options || [];
@@ -1616,7 +1796,40 @@
       showReady();
     }
 
+    async function bootSpotify() {
+      // Don't show loading screen immediately, as we'll do the track fetch
+      // quickly enough to not need a full blocking UI.
+      // Or show it, but don't block the UI with an automatic probe if not needed.
+
+      const stt = await new Promise((res) =>
+        chrome.runtime.sendMessage({ to: "bridge", cmd: "bridge-state" }, res));
+      if (!stt || !stt.connected) { showSetupError((stt && stt.error) || "not connected"); return; }
+
+      const ping = await send("ping", null, 10000);
+      if (!ping.ok) { showSetupError(ping.error || "no answer"); return; }
+
+      const t = await spGetTrack();
+      if (!t) {
+        showLoading(true);
+        showError("Play a song first, then open the menu.");
+        return;
+      }
+
+      st.downloadDir = "your Downloads folder";
+      // Delay setting spQuery until download is clicked
+      st.spQuery = null;
+      st.spTitle = t.title;
+      st.url = "spotify:track";
+      st.urlIsPage = false; // Important: prevents navWatch from closing the menu since we don't use the page URL
+      st.info = { title: t.title, uploader: t.artist, site: "Spotify", thumbnail: t.thumb || "" };
+      st.options = MP3_RATES.map((br) => ({ id: "a" + br, kind: "audio-mp3", label: "MP3 " + br + " kbps", mp3: br }))
+        .concat([1080, 720, 480, 360].map((h) => ({ id: "v" + h, kind: "video", height: h, label: "Music video " + h + "p" })));
+
+      showReady();
+    }
+
     async function boot() {
+      if (SPOTIFY) { await bootSpotify(); return; }
       // Page URL is the primary probe target. A player drop wins only when
       // it resolved to a real link for a DIFFERENT media item than the page;
       // an unreadable player (blob:/MSE-only) never blocks a media page.
@@ -1640,7 +1853,7 @@
       if (hit) {
         // Instant path: this page was already probed (prefetch or an earlier
         // open) and the tab has not moved to another video since.
-        st.url = hit.url; st.urlIsPage = isPage;
+        st.url = hit.url; st.useName = !!hit.useName; st.urlIsPage = isPage;
         st.info = hit.info; st.options = hit.options;
         showReady();
         // Still confirm the helper in the background so a dead bridge and

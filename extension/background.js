@@ -14,8 +14,8 @@ let seq = 0;
 // (no externally_connectable), so every page-side command also requires a
 // real click on our own button inside our own content script.
 const ALLOWED_CMDS = new Set(["ping", "versions", "probe", "download",
-  "cancel", "open-downloads", "update-engine", "bridge-state"]);
-const PAGE_HOSTS = /(^|\.)(youtube\.com|instagram\.com|reddit\.com|twitch\.tv|soundcloud\.com|streamable\.com|ted\.com)$/i;
+  "cancel", "song", "open-downloads", "open-downloads-tab", "update-engine", "bridge-state"]);
+const PAGE_HOSTS = /(^|\.)(youtube\.com|instagram\.com|reddit\.com|twitch\.tv|soundcloud\.com|spotify\.com|streamable\.com|ted\.com)$/i;
 
 let keepalive = null;
 const pending = new Set();
@@ -75,6 +75,18 @@ function ensurePort() {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.to === "save-file") {
+    const ok = sender && sender.tab && /^http:\/\/127\.0\.0\.1:\d+\/[\w-]+$/.test(msg.url || "");
+    if (!ok) { sendResponse({ ok: false }); return false; }
+    chrome.downloads.download({ url: msg.url, filename: String(msg.name || "song.mp3").replace(/[\\/:*?"<>|]/g, "_"), conflictAction: "uniquify" },
+      (id) => sendResponse({ ok: !!id, error: chrome.runtime.lastError && chrome.runtime.lastError.message }));
+    return true;
+  }
+  if (msg && msg.cmd === "open-downloads-tab") {
+    chrome.tabs.create({ url: "chrome://downloads" });
+    sendResponse({ ok: true });
+    return true;
+  }
   if (!msg || msg.to !== "bridge") return false;
   if (!ALLOWED_CMDS.has(msg.cmd)) {
     sendResponse({ ok: false, error: "Unknown request." });
