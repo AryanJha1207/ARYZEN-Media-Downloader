@@ -1,13 +1,15 @@
 {
   "manifest_version": 3,
   "name": "ARYZEN Media Downloader",
-  "version": "2.2.4",
+  "version": "2.3.0",
   "description": "Save video and audio from pages you browse, at the qualities the site actually offers. Runs fully on your own computer with a local yt-dlp engine.",
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
-    "nativeMessaging"
+    "nativeMessaging",
+    "downloads",
+    "tabs"
   ],
   "action": {
     "default_title": "ARYZEN Media Downloader",
@@ -32,7 +34,8 @@
         "*://*.twitch.tv/*",
         "*://*.soundcloud.com/*",
         "*://*.streamable.com/*",
-        "*://*.ted.com/*"
+        "*://*.ted.com/*",
+        "*://open.spotify.com/*"
       ],
       "js": [
         "content.js"
@@ -61,7 +64,8 @@
         "*://*.twitch.tv/*",
         "*://*.soundcloud.com/*",
         "*://*.streamable.com/*",
-        "*://*.ted.com/*"
+        "*://*.ted.com/*",
+        "*://open.spotify.com/*"
       ]
     }
   ]

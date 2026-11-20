@@ -20,9 +20,15 @@ The picker lists every format yt-dlp finds, video qualities first, then audio on
 
 ## Supported sites
 
-<img src="assets/diagrams/supported-sites.svg" width="100%" alt="Supported sites: YouTube, Instagram, Reddit, Twitch, SoundCloud" />
+<img src="assets/diagrams/supported-sites.svg" width="100%" alt="Supported sites: YouTube, Instagram, Reddit, Twitch, SoundCloud, Spotify" />
 
 Also supported: Streamable and TED.
+
+### New Features & Fixes
+- **Spotify Downloader:** Added functionality to detect the currently playing track via its browser URL (`open.spotify.com`), fetch its title/artist metadata, find a free download source, and download it as MP3 or video without bypassing DRM.
+- **Reddit Downloader:** Fixed and thoroughly tested the download and media extraction functionality for Reddit posts.
+- **Instagram Downloader:** Fixed download errors and authentication/cookie handling for reliable media retrieval.
+- **Liquid Glass UI:** Added stunning Liquid Glass styling and refraction effects to buttons, panels, and the download interface.
 
 ## How it works
 
