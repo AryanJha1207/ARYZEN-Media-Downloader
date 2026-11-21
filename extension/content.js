@@ -33,6 +33,10 @@
   // Same request/response contract as the toolbar popup: a command gets an
   // immediate ack {ok, id}; the real answer arrives later as {umd: {...}}
   // with a matching id. Events (progress/done/error) carry the job id.
+  // How long a click may wait for the helper's capability answer before it
+  // gives up visibly (never silently browser-saves on an unknown answer).
+  const CLICK_PING_MS = 8000;
+
   function send(cmd, extra, timeoutMs, onWorking) {
     return new Promise((resolve) => {
       let resp;
@@ -50,7 +54,7 @@
           const id = resp.id;
           const deadAnswer = () => {
             chrome.runtime.onMessage.removeListener(onMsg);
-            resolve({ ok: false, error: "No answer from the local helper. Open the extension popup and click Check; if it repeats, run the installer again and restart your browser." });
+            resolve({ ok: false, error: "No answer from the local helper. Wait a few seconds and try again, or open the extension popup and click Check; run the installer again only if Check also fails." });
           };
           let timer = setTimeout(deadAnswer, timeoutMs || 15000);
           function onMsg(m) {
@@ -796,6 +800,18 @@
       box-shadow: inset 0 0 0 1px rgba(255,255,255,.08), inset 0 -34px 36px -30px rgba(3,5,20,.55);
     }
     .umd-thumbwrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    /* Spotify only: album art is square, so the thumb box is square and the
+       whole artwork stays visible; title and details move to the top of the
+       controls column beside it. Every other site keeps the 16:9 video thumb
+       with the title below it. */
+    .umd-thumbwrap.umd-sq { aspect-ratio: 1 / 1; }
+    .umd-right.umd-tall { height: auto; min-height: calc(254px * 9 / 16); }
+    /* The tall column has slack the 16:9 column never had: keep the fields
+       grouped with their original spacing and let the slack fall below them,
+       not between the Save to label and its input. */
+    .umd-right.umd-tall .umd-destwrap { margin-top: 0; }
+    .umd-right .umd-title.umd-title-top { margin-top: 0; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 17.5px; font-weight: 700; }
+    .umd-right .umd-uploader.umd-uploader-top { margin-bottom: 14px; }
     .umd-thumbph {
       width: 52px; height: 52px; border-radius: 16px;
       background: linear-gradient(145deg, ACCENT88, ACCENT33); border: 1px solid ACCENT88;
@@ -910,6 +926,7 @@
     .umd-pctrow { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 14px; }
     .umd-pct { font-size: 40px; font-weight: 700; letter-spacing: -.03em; line-height: 1; font-variant-numeric: tabular-nums; }
     .umd-stage { font-size: 13px; color: var(--text2); }
+    .umd-trail { font-size: 11.5px; color: var(--text3); margin: -8px 0 10px; min-height: 14px; letter-spacing: .01em; }
     .umd-bar {
       height: 10px; border-radius: 999px; overflow: hidden;
       background: rgba(4,7,22,.52); border: 1px solid var(--edge); box-shadow: inset 0 1px 2px rgba(0,0,0,.4);
@@ -928,6 +945,10 @@
       animation: umd-glint 1.7s linear infinite;
     }
     @keyframes umd-glint { 0% { background-position: 120% 0; } 100% { background-position: -120% 0; } }
+    /* Stage without a known total (searching, converting): slide a partial
+       fill so the bar says "working" without claiming a fake percentage. */
+    .umd-fill.umd-indet { width: 40% !important; animation: umd-indet 1.15s ease-in-out infinite alternate; }
+    @keyframes umd-indet { from { transform: translateX(0); } to { transform: translateX(150%); } }
     .umd-stats { display: flex; gap: 10px; margin-top: 16px; }
     .umd-stat { flex: 1; min-width: 0; background: var(--well); border: 1px solid rgba(150,196,255,.14); box-shadow: var(--well-inset); border-radius: 12px; padding: 10px 13px; }
     .umd-stat .k { font-size: 12px; font-weight: 600; color: var(--text3); }
@@ -1661,10 +1682,11 @@
       st.phase = "ready";
       setPasteEnabled(true);
       body.innerHTML = "";
+      const isSpotify = site.name === "Spotify";
       const main = el("div", "umd-main");
 
       const left = el("div", "umd-left");
-      const tw = el("div", "umd-thumbwrap");
+      const tw = el("div", isSpotify ? "umd-thumbwrap umd-sq" : "umd-thumbwrap");
       if (st.info.thumbnail) {
         const img = document.createElement("img");
         img.src = st.info.thumbnail; img.alt = "";
@@ -1676,11 +1698,23 @@
       const dur = fmtDur(st.info.duration);
       if (dur) tw.appendChild(el("span", "umd-dur", dur));
       left.appendChild(tw);
-      left.appendChild(el("div", "umd-title", st.info.title || "Untitled media"));
-      const up = [st.info.uploader, st.info.site].filter(Boolean).join(" \u00b7 ");
-      if (up) left.appendChild(el("div", "umd-uploader", up));
+      // Spotify: the square art stands alone on the left; title and details
+      // sit at the top of the controls column beside it (his reference:
+      // Spotify's own track header, minus the "Song" label).
+      if (!isSpotify) {
+        left.appendChild(el("div", "umd-title", st.info.title || "Untitled media"));
+        const upL = [st.info.uploader, st.info.site].filter(Boolean).join(" \u00b7 ");
+        if (upL) left.appendChild(el("div", "umd-uploader", upL));
+      }
 
-      const right = el("div", "umd-right");
+      const right = el("div", isSpotify ? "umd-right umd-tall" : "umd-right");
+      if (isSpotify) {
+        const topTitle = el("div", "umd-title umd-title-top", st.info.title || "Untitled media");
+        topTitle.title = st.info.title || ""; // one line with ellipsis; hover shows the full title
+        right.appendChild(topTitle);
+        const upR = [st.info.uploader, st.info.site].filter(Boolean).join(" \u00b7 ");
+        if (upR) right.appendChild(el("div", "umd-uploader umd-uploader-top", upR));
+      }
       right.appendChild(el("div", "umd-label", "Format"));
       const selWrap = el("div", "umd-selectwrap");
       const sel = document.createElement("select");
@@ -1795,19 +1829,25 @@
       body.innerHTML = "";
       const w = el("div", "umd-prog");
       const row = el("div", "umd-pctrow");
-      const pct = el("div", "umd-pct", "0%");
+      const pct = el("div", "umd-pct", "\u2014");
       pct.id = "umd-pct";
       row.append(pct, el("div", "umd-stage", "Starting\u2026"));
       row.querySelector(".umd-stage").id = "umd-stage";
+      // Completed stages stay visible as a small trail, so even a transfer
+      // too fast to follow leaves its true sequence on screen.
+      const trail = el("div", "umd-trail", "");
+      trail.id = "umd-trail";
+      st.stageTrail = []; st.stageFam = "";
       const bar = el("div", "umd-bar");
       const fill = el("div", "umd-fill");
       fill.id = "umd-fill";
+      fill.classList.add("umd-indet");  // no real percentage until the first one arrives
       bar.appendChild(fill);
       const stats = el("div", "umd-stats");
       stats.innerHTML =
         '<div class="umd-stat"><div class="k">Speed</div><div class="v" id="umd-speed">\u2014</div></div>' +
         '<div class="umd-stat"><div class="k">ETA</div><div class="v" id="umd-eta">\u2014</div></div>';
-      w.append(row, bar, stats);
+      w.append(row, trail, bar, stats);
       body.appendChild(w);
       renderFoot("", [ghostBtn("Cancel", cancelJob)]);
     }
@@ -1816,23 +1856,47 @@
       st.phase = "done";
       setPasteEnabled(true);
       body.innerHTML = "";
+      const mode = filePath ? "success" : (pd && pd.mode) || (pd && pd.viaBrowser ? "pending" : "success");
       const w = el("div", "umd-done");
       const cw = el("div", "umd-checkwrap");
-      const ring = el("div", "umd-checkring");
-      ring.innerHTML =
-        '<svg width="40" height="40" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
-        '<path d="M4.5 12.5l5 5 10-11" stroke="#8fe0ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-      const lg = el("div", "umd-sitelogo");
-      const li = document.createElement("img");
-      li.src = faviconUrl(); li.alt = site.name; li.onerror = () => li.remove();
-      lg.appendChild(li);
-      cw.append(ring, lg);
+      if (mode === "pending") {
+        // A save dialog / helper move is still in flight - spinner, not a check.
+        const sp = el("div", "umd-spin");
+        sp.style.margin = "auto";
+        cw.appendChild(sp);
+      } else {
+        const ring = el("div", "umd-checkring");
+        ring.innerHTML = mode === "failed"
+          ? '<svg width="40" height="40" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
+            '<path d="M12 7v6" stroke="#ff9d9d" stroke-width="3" stroke-linecap="round"/>' +
+            '<path d="M12 16.4v.6" stroke="#ff9d9d" stroke-width="3" stroke-linecap="round"/></svg>'
+          : '<svg width="40" height="40" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
+            '<path d="M4.5 12.5l5 5 10-11" stroke="#8fe0ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+        const lg = el("div", "umd-sitelogo");
+        const li = document.createElement("img");
+        li.src = faviconUrl(); li.alt = site.name; li.onerror = () => li.remove();
+        lg.appendChild(li);
+        cw.append(ring, lg);
+      }
 
-      // Show file name
-      w.append(cw, el("div", "umd-donetitle", "Download complete"));
+      // A browser Save-dialog flow has not finished when the helper answers,
+      // so it gets no completion claim yet; the background's save-outcome
+      // message re-renders this card with pd.mode set.
+      const titleEl = el("div", "umd-donetitle",
+        mode === "pending" ? "Save in progress" : mode === "failed" ? "Save not finished" : "Download complete");
+      w.append(cw, titleEl);
 
-      // Show file path if available
-      if (filePath) {
+      if (mode === "failed") {
+        // Wrapped, unclipped: the recovery instructions matter most here.
+        const f = el("div", "umd-donefile",
+          "No file was saved to your selected folder - the browser save was cancelled or failed. " +
+          "The download is kept in AMD's temporary folder, so you can start it again from the menu.");
+        f.style.whiteSpace = "normal";
+        f.style.maxWidth = "440px";
+        f.style.lineHeight = "1.5";
+        w.append(f);
+      } else if (filePath) {
+        // Show file path if available
         const pathDiv = el("div", "umd-donefile");
         pathDiv.style.fontSize = "12px";
         pathDiv.style.color = "var(--text2)";
@@ -1848,7 +1912,12 @@
         pathDiv.title = filePath; // Full path on hover
         w.append(pathDiv);
       } else if (pd && pd.saveAs) {
-        w.append(el("div", "umd-donefile", "📁 Saved where you chose: " + file));
+        w.append(el("div", "umd-donefile",
+          mode === "success" && pd.finalName
+            ? "📁 Saved where you chose: " + pd.finalName
+            : "📁 Pick a folder in the Save dialog: " + file));
+      } else if (mode === "pending" && pd && pd.label && file) {
+        w.append(el("div", "umd-donefile", "📁 Saving to " + pd.label + "/" + file + "\u2026"));
       } else if (pd && pd.label && file) {
         // "Downloads/..." here is the browser's download folder, which the
         // user may have pointed somewhere other than the OS Downloads folder.
@@ -1860,12 +1929,19 @@
       }
 
       body.appendChild(w);
-      renderFoot("", [
-        primaryBtn("Open Folder", () => send("open-downloads", filePath ? { path: filePath.replace(/[\\/][^\\/]*$/, "") } : null)),
-        ghostBtn("Show in Chrome", () => chrome.runtime.sendMessage({ to: "bridge", cmd: "open-downloads-tab" })),
-        ghostBtn("Close", close)
-      ]);
+      if (mode === "pending") {
+        renderFoot("", [ghostBtn("Close", close)]);
+      } else if (mode === "failed") {
+        renderFoot("", [ghostBtn("Close", close), primaryBtn("Try again", boot)]);
+      } else {
+        renderFoot("", [
+          primaryBtn("Open Folder", () => send("open-downloads", filePath ? { path: filePath.replace(/[\\/][^\\/]*$/, "") } : null)),
+          ghostBtn("Show in Chrome", () => chrome.runtime.sendMessage({ to: "bridge", cmd: "open-downloads-tab" })),
+          ghostBtn("Close", close)
+        ]);
+      }
       // Don't auto-close - let user decide when to close
+      st.doneContext = { file, filePath, pd };
     }
 
     // ---- actions
@@ -1882,6 +1958,7 @@
       // For Spotify, ensure we have the track info before downloading
       if (SPOTIFY && !st.spQuery) {
         const t = await spGetTrack();
+        if (!overlay) return; // menu closed while the track fetch was in flight
         if (t) {
           st.spQuery = (t.artist ? t.artist + " " : "") + t.title;
           st.spTitle = t.title;
@@ -1896,20 +1973,58 @@
         return;
       }
 
-      // Destination routing: "Downloads/..."-style relative folders are saved
-      // by the browser into its download directory; absolute folders are
-      // placed directly by the local helper; "Ask each time" uses the
-      // browser's Save dialog for this download.
+      // Destination routing: with the current helper, every destination is
+      // placed DIRECTLY by the helper - relative folders resolve inside the
+      // helper's reported download dir. The browser's download manager (and
+      // its "ask where to save every file" prompt, which ignores saveAs:false)
+      // is only used for the explicit "Ask each time" choice, or as the
+      // fallback when an old helper without dest placement is running.
+      // Capability must be KNOWN before routing: when the menu opened from a
+      // prefetched probe the boot ping can still be in flight, and routing on
+      // an unknown destSupport silently falls back to the browser save (the
+      // dialog this pass exists to avoid). Await one quick ping; only a real
+      // answer flips destSupport either way.
+      if (st.destSupport === undefined) {
+        const ping = await send("ping", null, CLICK_PING_MS);
+        if (!overlay) return; // menu closed while the answer was in flight
+        if (!ping.ok) {
+          // No blind fallthrough to a browser save: say what is wrong and
+          // stay in the menu so the user can act on it.
+          showError(ping.error || "The helper did not answer. Wait a few seconds and try again, or open the extension popup and click Check.");
+          return;
+        }
+        if (ping.download_dir) st.downloadDir = ping.download_dir;
+        st.destSupport = !!ping.dest_support;
+      }
       let destAbs = "", subdir = "";
       const saveAs = !!st.saveAsOnce;
       let destLabel = "";
+      const dlBase = /^([A-Za-z]:[\\/]|\/)/.test(String(st.downloadDir || ""))
+        ? String(st.downloadDir).replace(/[\\/]+$/, "") : "";
       if (!saveAs) {
         let v = String(st.dest || "").trim().replace(/\s+/g, " ").replace(/\/+$/, "");
         if (!v) v = "Downloads/AMD/" + site.name;
         destLabel = v;
         if (/^~?[\/]/.test(v) || /^[A-Za-z]:[\\/]/.test(v)) destAbs = v;
-        else if (/^Downloads$/i.test(v)) subdir = "";  // Downloads root itself
-        else subdir = v.replace(/^Downloads\//i, "") || ("AMD/" + site.name);
+        else {
+          const rel = /^Downloads$/i.test(v) ? "" : (v.replace(/^Downloads\//i, "") || ("AMD/" + site.name));
+          if (st.destSupport && dlBase) destAbs = rel ? dlBase + "/" + rel : dlBase;
+          else subdir = rel;  // old helper / unknown base: the browser saves it
+        }
+      }
+      if (!saveAs && !destAbs && !st.destSupport) {
+        // A pre-placement helper cannot honor a chosen folder, and the old
+        // browser fallback silently ignored the destination (and can prompt
+        // for a location). Refuse visibly with the way forward.
+        showError("This version of the AMD helper can't save to a chosen folder. Run the latest setup script to update it, then try again.");
+        return;
+      }
+      if (!saveAs && !destAbs && st.destSupport) {
+        // The helper claims dest placement but never reported a usable
+        // download dir; routing on would silently browser-save. Refuse
+        // visibly instead.
+        showError("The helper answered but did not report its download folder. Run the setup script once more, then try again.");
+        return;
       }
       if (destAbs && !st.destSupport) {
         // An older helper silently ignores "dest" and would save to the wrong
@@ -1934,12 +2049,37 @@
     }
 
     jobListeners.add(function onJob(g) {
-      if (!st.job || g.job !== st.job.id) return;
+      // The active job, plus the just-finished one: the browser's
+      // save-outcome for a staged file lands after the job closed.
+      if (!g.job || (g.job !== (st.job && st.job.id) && g.job !== st.lastDoneJob)) return;
       const $id = (i) => shadow.getElementById(i);
       if (g.type === "progress") {
         const p = Math.max(0, Math.min(100, g.pct || 0));
-        if ($id("umd-fill")) $id("umd-fill").style.width = p + "%";
-        if ($id("umd-pct")) $id("umd-pct").textContent = (Math.round(p * 10) / 10) + "%";
+        if (g.stage) {
+          // Family = the stage's first word ("downloaded" counts as
+          // "downloading"); on change, the previous stage joins the trail.
+          const famRaw = String(g.stage).split(" ")[0].toLowerCase();
+          const fam = famRaw === "downloaded" ? "downloading" : famRaw;
+          if (fam !== (st.stageFam || "")) {
+            const LABEL = { searching: "Searching", found: "Found", downloading: "Downloading",
+                            converting: "Converting", finishing: "Finishing", saving: "Saving" };
+            if (st.stageFam && LABEL[st.stageFam]) {
+              st.stageTrail = (st.stageTrail || []).concat(LABEL[st.stageFam] + " \u2713").slice(-3);
+            }
+            st.stageFam = fam;
+            const tr = $id("umd-trail");
+            if (tr) tr.textContent = (st.stageTrail || []).join("  \u00b7  ");
+          }
+        }
+        // A stage with no real percentage yet (searching, probing) shows
+        // activity, not a misleading pinned 0%.
+        const ind = !!g.stage && p === 0;
+        const fillEl = $id("umd-fill"), pctEl = $id("umd-pct");
+        if (fillEl) {
+          if (ind) { fillEl.classList.add("umd-indet"); fillEl.style.width = ""; }
+          else { fillEl.classList.remove("umd-indet"); fillEl.style.width = p + "%"; }
+        }
+        if (pctEl) pctEl.textContent = ind ? "\u2014" : (Math.round(p * 10) / 10) + "%";
         if ($id("umd-speed")) $id("umd-speed").textContent = g.speed || "\u2014";
         if ($id("umd-eta")) $id("umd-eta").textContent = g.eta || "\u2014";
         if ($id("umd-stage")) $id("umd-stage").textContent = g.stage
@@ -1947,13 +2087,23 @@
           : "Downloading\u2026";
       } else if (g.type === "done") {
         st.job = null;
+        st.lastDoneJob = g.job;
         const pd = st.pendingDest || {};
         // A staged path is the helper's private temp folder - never show it.
         // Browser-saved files show the folder the user actually picked;
         // helper-placed files show their real absolute folder.
+        pd.viaBrowser = !!g.url;
         showDone(g.file, g.placed ? g.path : null, pd);
         if (g.url) chrome.runtime.sendMessage({ to: "save-file", url: g.url, name: g.file,
-          subdir: pd.subdir || "", saveAs: !!pd.saveAs, label: pd.label || "", job: g.job || "" });
+          subdir: pd.subdir || "", saveAs: !!pd.saveAs, label: pd.label || "", job: g.job || "" },
+          (resp) => {
+            // The browser refused the save outright (bad folder, cancelled
+            // before start): say so instead of leaving a success card up.
+            if (chrome.runtime.lastError || !resp || !resp.ok) {
+              showError((resp && resp.error) ||
+                "The browser could not save the file. The file is kept in AMD's temporary folder - start the download again from the menu.");
+            }
+          });
         // Destination history: browser-saved downloads are recorded by the
         // background worker only after the save COMPLETES; a helper-placed
         // file is already in its folder here, so it counts as saved now.
@@ -1968,6 +2118,19 @@
         if (pd.label) st.dest = pd.label;
         st.saveAsOnce = false; st.pendingDest = null;
         saveDestState();
+      } else if (g.type === "save-outcome") {
+        // The browser's save of a staged file reached its real end state.
+        if (st.phase !== "done") return;
+        const ctx = st.doneContext;
+        if (ctx && ctx.pd) {
+          if (g.ok) {
+            ctx.pd.mode = "success";
+            if (ctx.pd.saveAs && g.name) ctx.pd.finalName = String(g.name).split("/").pop();
+          } else {
+            ctx.pd.mode = "failed";
+          }
+          showDone(ctx.file, ctx.filePath, ctx.pd);
+        }
       } else if (g.type === "error") {
         st.job = null;
         if (st.phase === "downloading") showError(g.error || "Download failed.");
@@ -2041,6 +2204,12 @@
       }
 
       st.downloadDir = "your Downloads folder";
+      // Keep the helper's real capability + base dir. Dropping these (a
+      // display placeholder survived instead) routed every Spotify click
+      // blind: the browser saved, and a global "ask where to save" pref
+      // turned that into the Save dialog.
+      if (ping.download_dir) st.downloadDir = ping.download_dir;
+      st.destSupport = !!ping.dest_support;
       // Delay setting spQuery until download is clicked
       st.spQuery = null;
       st.spTitle = t.title;
@@ -2086,8 +2255,13 @@
         // Still confirm the helper in the background so a dead bridge and
         // the download dir surface correctly instead of failing at click.
         send("ping", null, 10000).then((ping) => {
+          if (!ping.ok) {
+            // A late failure must not replace an in-progress download's UI;
+            // the click path runs its own awaited ping before routing.
+            if (st.phase === "ready") showSetupError(ping.error || "no answer");
+            return;
+          }
           if (st.phase !== "ready" && st.phase !== "downloading") return;
-          if (!ping.ok) { showSetupError(ping.error || "no answer"); return; }
           if (ping.download_dir) st.downloadDir = ping.download_dir;
           st.destSupport = !!ping.dest_support;
         });

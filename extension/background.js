@@ -89,7 +89,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // ("AMD/Reddit"): relative only, no traversal, no absolute paths.
     const sub = String(msg.subdir || "").replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "");
     if (sub) {
-      if (!/^[\w .()\-]+(\/[\w .()\-]+)*$/.test(sub) || sub.includes("..")) {
+      // Relative subfolders only: no traversal, no absolute/drive paths, no
+      // backslashes. Everything else - spaces, apostrophes, & and non-ASCII
+      // names - is a legitimate folder name and is allowed through.
+      if (sub.includes("..") || sub.includes("\\") || /^([A-Za-z]:|\/)/.test(sub)) {
         sendResponse({ ok: false, error: "Bad destination folder." });
         return false;
       }
@@ -104,11 +107,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // listener registers even without a label ("Ask each time" saves).
         const label = String(msg.label || "");
         const hasJob = !!String(msg.job || "");
+        const tabId = sender && sender.tab && sender.tab.id;
         if (!id || (!label && !hasJob)) return;
         const onChanged = (d) => {
           if (d.id !== id || !d.state) return;
           if (d.state.current !== "complete" && d.state.current !== "interrupted") return;
           chrome.downloads.onChanged.removeListener(onChanged);
+          // Tell the menu the browser-side save reached its REAL end state,
+          // so the card only claims "complete" once the file exists.
+          if (typeof tabId === "number") try {
+            chrome.tabs.sendMessage(tabId, { umd: { type: "save-outcome",
+              job: String(msg.job || ""), ok: d.state.current === "complete",
+              name: fname } });
+          } catch (e) {}
           if (d.state.current !== "complete") return;
           if (label) try {
             chrome.storage.local.get(["umdDests"], (rr) => {
@@ -117,8 +128,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             });
           } catch (e) {}
           // The browser has its copy; the helper's staged copy can go. An
-          // interrupted save keeps the staged file (24h sweep owns it), so a
-          // fresh retry of the whole download is never the only way back.
+          // interrupted save keeps the staged copy (the bridge never
+          // auto-deletes staged files), so a retry never loses data.
           const job = String(msg.job || "");
           if (job) {
             try {

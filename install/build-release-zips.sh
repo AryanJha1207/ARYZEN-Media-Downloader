@@ -36,6 +36,9 @@ build_one() {  # $1 = OS slug
   cp -R "$ROOT/extension" "$D/extension"
   cp "$ROOT/install/install-linux.sh" "$ROOT/install/install-macos.sh" "$ROOT/install/install-windows.ps1" "$D/install/"
   cp "$ROOT/bridge/umd_host.py" "$ROOT/bridge/run-host.bat" "$ROOT/bridge/run-host.sh" "$ROOT/bridge/com.umd.bridge.rc.json" "$D/bridge/"
+  # Executable bits are set explicitly here so the ZIPs come out right even if
+  # the working tree lost them (e.g. a zip round-trip dropped them).
+  chmod 755 "$D/install/install-macos.sh" "$D/install/install-linux.sh" "$D/bridge/run-host.sh"
   write_wrappers "$OS" "$D"
   find "$D" -name '.DS_Store' -delete 2>/dev/null || true
   (cd "$STAGE" && zip -q -r -X "$OUT/ARYZEN-Media-Downloader-$OS.zip" "ARYZEN-Media-Downloader-$OS")
@@ -230,6 +233,28 @@ for OS in Windows macOS-AppleSilicon macOS-Intel Linux; do
   build_one "$OS"
 done
 rm -rf "$STAGE"
+
+# Verify the executable entries actually carry their exec bit inside each ZIP.
+check_zip_modes() {  # $1 = zip path
+  Z="$1"
+  LST=$(unzip -Z -l "$Z" 2>/dev/null) || { echo "x could not inspect $Z" >&2; exit 1; }
+  for rel in install/install-macos.sh install/install-linux.sh bridge/run-host.sh; do
+    printf '%s\n' "$LST" | grep -E "^-rwxr-xr-x.*/$rel\$" >/dev/null \
+      || { echo "x $Z: $rel lost its executable bit in the archive" >&2; exit 1; }
+  done
+  case "$Z" in
+    *macOS-*)
+      printf '%s\n' "$LST" | grep -E "^-rwxr-xr-x.*/Install ARYZEN Media Downloader.command\$" >/dev/null \
+        || { echo "x $Z: the .command installer lost its executable bit in the archive" >&2; exit 1; } ;;
+    *Linux*)
+      printf '%s\n' "$LST" | grep -E "^-rwxr-xr-x.*/Install ARYZEN Media Downloader.sh\$" >/dev/null \
+        || { echo "x $Z: the .sh installer lost its executable bit in the archive" >&2; exit 1; } ;;
+  esac
+}
+for OS in Windows macOS-AppleSilicon macOS-Intel Linux; do
+  check_zip_modes "$OUT/ARYZEN-Media-Downloader-$OS.zip"
+done
+echo "+ executable bits verified inside all four ZIPs"
 
 echo
 echo "== SHA-256"

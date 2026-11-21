@@ -78,6 +78,24 @@ _active_procs = {}
 _finished_staged = set()
 
 
+# Progress coalescing: HLS fragment lines can arrive at well over 100/sec;
+# forwarding every one would swamp the native-messaging channel and the
+# overlay. Stage beats (searching/found/converting/finishing) and all
+# done/error/cancel messages always go out immediately; only the high-rate
+# pct/byte beats coalesce, and each one that goes out carries the LATEST
+# numbers read, never stale ones.
+_prog_last = {}
+_prog_pending = {}
+
+def _prog_beat(rid, key, interval=0.1, now=None):
+    now = time.time() if now is None else now
+    last = _prog_last.get(rid)
+    if last is None or last[1] != key or now - last[0] >= interval:
+        _prog_last[rid] = (now, key)
+        return True
+    return False
+
+
 def log(msg):
     try:
         with open(LOG, "a") as f:
@@ -144,7 +162,12 @@ def base_args():
     # sys.executable: the zipapp is pure Python; run it with the interpreter
     # already running this bridge (no PATH/env dependence, no Gatekeeper event).
     args = [sys.executable, str(YTDLP), "--ignore-config", "--no-plugin-dirs", "--no-playlist",
-            "--no-warnings", "--no-color", "--ffmpeg-location", str(BIN)]
+            "--no-warnings", "--no-color", "--ffmpeg-location", str(BIN),
+            # Over a pipe yt-dlp emits NO progress lines for some downloaders
+            # (reproduced: hlsnative/m3u8 prints only "Download completed",
+            # leaving the UI on "Searching" until the file lands). --progress
+            # forces real percentage/fragment lines on every downloader.
+            "--progress"]
     # YouTube extraction requires a real JavaScript runtime for its JS
     # challenges (yt-dlp announcement #14404). Deno is the only runtime
     # yt-dlp auto-detects; point it at the copy our installer placed in
@@ -470,6 +493,10 @@ def do_probe(rid, url):
 # ---------------- download ----------------
 
 PCT = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+# Byte-amount-only lines appear when the server gives no total size
+# (chunked/streamed answers): "[download]   12.34MiB at  1.23MiB/s".
+BYTES = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?\s*[KMGT]i?B)\s+at\s+")
+FRAG = re.compile(r"\(frag (\d+)/(\d+)\)")
 SPEED = re.compile(r"\sat\s+(\S+)")
 ETA = re.compile(r"\sETA\s+(\S+)")
 DEST = re.compile(r"Destination:\s*(.+)$")
@@ -612,13 +639,62 @@ def run_download(rid, url, kind, selector, mp3, name="", target_dir=None):
                     res["final"] = m.group(1).strip()
                 m = PCT.search(line)
                 if m:
+                    # HLS fragment lines carry a swinging "~" size estimate;
+                    # the fragment count is the only truthful percentage.
+                    fm = FRAG.search(line)
+                    # HLS: the percentage is FRAGMENTS complete, not a byte
+                    # fraction; separate audio/video streams each count their
+                    # own fragments, so it restarts per stream.
+                    pct = (int(fm.group(1)) / int(fm.group(2)) * 100.0) if fm else float(m.group(1))
                     sp = SPEED.search(line)
                     et = ETA.search(line)
-                    send({"type": "progress", "job": rid,
-                          "pct": min(float(m.group(1)), 100.0),
-                          "speed": sp.group(1) if sp else "",
-                          "eta": et.group(1) if et else "",
-                          "ts": time.time()})
+                    # A stream's 100% line / last fragment means THIS stream
+                    # finished - another phase (audio after video) may still
+                    # follow, so the completion beat stays the neutral
+                    # "finishing"; only a real postprocessor line names
+                    # conversion. Post-process lines do not print over a
+                    # pipe without verbose, so without this the card would
+                    # pin "downloading" at 99 through the ffmpeg work.
+                    complete = (fm and fm.group(1) == fm.group(2)) or (not fm and pct >= 100.0)
+                    if complete:
+                        if _prog_beat(rid, "fin"):
+                            pend = _prog_pending.pop(rid, None)
+                            if pend:
+                                send(pend)  # final real progress the throttle held
+                            send({"type": "progress", "job": rid, "pct": 99.0,
+                                  "stage": "finishing", "ts": time.time()})
+                        else:
+                            _prog_pending.pop(rid, None)
+                    else:
+                        lp = _prog_last.get(rid)
+                        msg = {"type": "progress", "job": rid,
+                               "pct": min(pct, 100.0),
+                               "speed": sp.group(1) if sp else "",
+                               "eta": et.group(1) if et else "",
+                               "ts": time.time()}
+                        if lp and lp[1] == "fin" and pct >= 99.0:
+                            pass  # straggler after completion; a new stream restarts below 99
+                        elif _prog_beat(rid, "dl"):
+                            _prog_pending.pop(rid, None)
+                            send(msg)
+                        else:
+                            _prog_pending[rid] = msg  # latest numbers, kept for the flush
+                else:
+                    # No total size (chunked/streamed answer): report activity,
+                    # never a frozen 0%. pct 0 with a stage string makes the
+                    # overlay's indeterminate bar carry the amount so far.
+                    bm = BYTES.search(line)
+                    if bm:
+                        sp = SPEED.search(line)
+                        msg = {"type": "progress", "job": rid, "pct": 0,
+                               "stage": "downloaded " + bm.group(1),
+                               "speed": sp.group(1) if sp else "",
+                               "ts": time.time()}
+                        if _prog_beat(rid, "dl"):
+                            _prog_pending.pop(rid, None)
+                            send(msg)
+                        else:
+                            _prog_pending[rid] = msg
             proc.wait()
             res["ret"] = proc.returncode
             return res
@@ -699,6 +775,7 @@ def run_download(rid, url, kind, selector, mp3, name="", target_dir=None):
         with _jobs_lock:
             _active_procs.pop(rid, None)
             _jobs.pop(rid, None)
+            _prog_last.pop(rid, None)
 
 
 def ffmpeg_present():
@@ -870,6 +947,10 @@ def run_song(rid, query, title, kind="audio-mp3", mp3=320, height=720,
                     return
             send({"type": "progress", "job": rid, "pct": 0.0,
                   "stage": "searching " + label, "ts": time.time()})
+            # A new source starts fresh: its found/first beats must not be
+            # eaten by the previous source's throttle window.
+            _prog_last.pop(rid, None)
+            _prog_pending.pop(rid, None)
             args = base_args() + [
                 "--newline", "--paths", str(out_dir),
                 "-o", "%(title).120B.%(ext)s",
@@ -887,6 +968,7 @@ def run_song(rid, query, title, kind="audio-mp3", mp3=320, height=720,
                 _active_procs[rid] = proc
                 _jobs.setdefault(rid, {"state": "running"})
             final, tail = None, []
+            found_sent = False
             for line in proc.stdout:
                 line = line.rstrip("\n")
                 tail.append(line)
@@ -894,16 +976,71 @@ def run_song(rid, query, title, kind="audio-mp3", mp3=320, height=720,
                 if line.startswith(str(out_dir)) and line.lower().endswith(MEDIA_EXT):
                     final = line.strip()
                     continue
+                if not found_sent and (PCT.search(line) or BYTES.search(line) or FRAG.search(line)):
+                    # The search resolved and real bytes are moving: say so
+                    # once, truthfully, before the percentage beats.
+                    found_sent = True
+                    send({"type": "progress", "job": rid, "pct": 0,
+                          "stage": "found on " + label, "ts": time.time()})
                 m = PCT.search(line)
                 if m:
+                    # HLS fragment lines: the "~" total is a swinging estimate,
+                    # so the displayed percentage comes from fragments done.
+                    fm = FRAG.search(line)
+                    # HLS: percentage is FRAGMENTS complete (not bytes); it
+                    # restarts if the source serves separate streams.
+                    pct = (int(fm.group(1)) / int(fm.group(2)) * 100.0) if fm else float(m.group(1))
                     sp = SPEED.search(line)
                     et = ETA.search(line)
-                    send({"type": "progress", "job": rid,
-                          "pct": min(float(m.group(1)), 99.0),
-                          "speed": sp.group(1) if sp else "",
-                          "eta": et.group(1) if et else "",
-                          "stage": label, "ts": time.time()})
+                    complete = (fm and fm.group(1) == fm.group(2)) or (not fm and pct >= 100.0)
+                    if complete:
+                        # This stream finished; ffmpeg post-work follows but
+                        # its lines do not print over a pipe. Neutral label:
+                        # completion of one stream is not proof conversion
+                        # started (a second stream may still download).
+                        if _prog_beat(rid, "fin"):
+                            pend = _prog_pending.pop(rid, None)
+                            if pend:
+                                send(pend)  # final real progress the throttle held
+                            send({"type": "progress", "job": rid, "pct": 99.0,
+                                  "stage": "finishing", "ts": time.time()})
+                        else:
+                            _prog_pending.pop(rid, None)
+                    else:
+                        lp = _prog_last.get(rid)
+                        msg = {"type": "progress", "job": rid,
+                               "pct": min(pct, 99.0),
+                               "speed": sp.group(1) if sp else "",
+                               "eta": et.group(1) if et else "",
+                               "stage": "downloading " + label, "ts": time.time()}
+                        if lp and lp[1] == "fin" and pct >= 99.0:
+                            pass  # straggler after completion; a new stream restarts below 99
+                        elif _prog_beat(rid, "dl"):
+                            _prog_pending.pop(rid, None)
+                            send(msg)
+                        else:
+                            _prog_pending[rid] = msg
+                elif BYTES.search(line):
+                    # Unknown total size: show the amount so far, pct 0
+                    # renders as the indeterminate bar in the overlay.
+                    bm = BYTES.search(line)
+                    sp = SPEED.search(line)
+                    msg = {"type": "progress", "job": rid, "pct": 0,
+                           "stage": "downloaded " + bm.group(1) + " from " + label,
+                           "speed": sp.group(1) if sp else "", "ts": time.time()}
+                    if _prog_beat(rid, "dl"):
+                        _prog_pending.pop(rid, None)
+                        send(msg)
+                    else:
+                        _prog_pending[rid] = msg
+                elif "[ExtractAudio]" in line and kind == "audio-mp3":
+                    # An actual postprocessor event: naming conversion is now
+                    # grounded, not inferred from a finished stream.
+                    _prog_pending.pop(rid, None)
+                    send({"type": "progress", "job": rid, "pct": 99.0,
+                          "stage": "converting audio", "ts": time.time()})
                 elif "[ExtractAudio]" in line or "[Merger]" in line:
+                    _prog_pending.pop(rid, None)
                     send({"type": "progress", "job": rid, "pct": 99.0,
                           "stage": "finishing", "ts": time.time()})
             proc.wait()
@@ -937,6 +1074,7 @@ def run_song(rid, query, title, kind="audio-mp3", mp3=320, height=720,
         with _jobs_lock:
             _active_procs.pop(rid, None)
             _jobs.pop(rid, None)
+            _prog_last.pop(rid, None)
 
 
 def do_song(rid, msg):
