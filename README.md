@@ -223,6 +223,8 @@ The site logos in this README come from the [gilbarbara/logos](https://github.co
 
 ## Licenses
 
+Use responsibly—download only content you own or have permission to access; Aryzen Media Downloader does not encourage unauthorized downloads.
+
 This project's own code is under the [MIT License](LICENSE), Copyright (c) 2026 Aryzen Nex. Bundled third-party works keep their own licenses (see [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)), and components the installer downloads (yt-dlp, FFmpeg, the Python runtime) keep theirs. Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Licenses of the bundled dependencies, stated as facts:
