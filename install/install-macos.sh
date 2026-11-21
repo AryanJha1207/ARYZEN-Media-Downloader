@@ -11,8 +11,13 @@
 # It never touches an existing ~/universal-media-downloader install or the
 # original com.umd.bridge registration.
 set -eu
-# Bug fix: ensure pipeline failures are caught
-set -o pipefail
+# Pipeline failures are caught where the shell supports it (bash, and
+# macOS /bin/sh). POSIX sh on Debian/Ubuntu (dash) has no pipefail and would
+# abort the whole installer on this line, so it is optional by design: every
+# pipeline that needs failure handling has its own guard.
+# Probe in a subshell first: 'set' is a special builtin, and dash aborts on
+# its error even with '|| true'.
+if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
 
 ESC=$(printf '\033')
 RESET="$ESC[0m"; BOLD="$ESC[1m"
@@ -68,6 +73,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Temp workspace (must exist before component registration below)
+TMPF=$(mktemp -d)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Component framework: each component the installer manages gets a definition
 # and helper functions. This enables the CHECK pass (stage 0) to print a plan
@@ -85,40 +93,81 @@ COMP_CHECKSUM_URL=""    # URL to fetch expected checksum
 COMP_IS_SYSTEM=""       # "1" = check-only system tool, never installed by us
 COMP_STAGE_FN=""        # stage function name to run for INSTALL/UPDATE
 
+# Helper functions for managing component data.
+# Replaces old eval-based dynamic variable names with static lookups in a data file.
+# To ensure compatibility with bash 3.2, we use a temp file acting as a flat DB.
+
+comp_db() {
+    # Flat-file component store (bash 3.2 has no associative arrays, so a small
+    # temp file acts as the registry). Rows are key<TAB>field<TAB>value: the TAB
+    # delimiter keeps values containing spaces and pipes (version probe commands)
+    # intact, and reads never fail the script on a missing key.
+    [ -n "$TMPF" ] || TMPF=$(mktemp -d)
+    _db="$TMPF/comp_db"
+    [ -f "$_db" ] || : > "$_db"
+    _tab=$(printf '\t')
+    if [ "$#" -eq 3 ]; then
+        # Write: comp_db <key> <field> <value>
+        grep -v "^$1$_tab$2$_tab" "$_db" > "$_db.tmp" 2>/dev/null || true
+        printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$_db.tmp"
+        mv "$_db.tmp" "$_db"
+    elif [ "$#" -eq 2 ]; then
+        # Read: comp_db <key> <field> (empty output when unset)
+        grep "^$1$_tab$2$_tab" "$_db" 2>/dev/null | cut -d"$_tab" -f3- || true
+    fi
+}
+
 # Register a component
-# Usage: comp_register key "Install Path" "version_cmd" "required_version" "fetch_url" "checksum_url" "is_system" "stage_fn"
 comp_register() {
     key="$1"; install_path="$2"; version_cmd="$3"; required_version="$4"
     fetch_url="$5"; checksum_url="$6"; is_system="$7"; stage_fn="$8"
 
     COMP_NAMES="$COMP_NAMES $key"
-    eval "COMP_INSTALL_PATH_$key=\"$install_path\""
-    eval "COMP_VERSION_CMD_$key=\"$version_cmd\""
-    eval "COMP_REQUIRED_VERSION_$key=\"$required_version\""
-    eval "COMP_FETCH_URL_$key=\"$fetch_url\""
-    eval "COMP_CHECKSUM_URL_$key=\"$checksum_url\""
-    eval "COMP_IS_SYSTEM_$key=\"$is_system\""
-    eval "COMP_STAGE_FN_$key=\"$stage_fn\""
+    comp_db "$key" "install_path" "$install_path"
+    comp_db "$key" "version_cmd" "$version_cmd"
+    comp_db "$key" "required_version" "$required_version"
+    comp_db "$key" "fetch_url" "$fetch_url"
+    comp_db "$key" "checksum_url" "$checksum_url"
+    comp_db "$key" "is_system" "$is_system"
+    comp_db "$key" "stage_fn" "$stage_fn"
 }
+
 
 # Get installed version by running the component's version command
 # Prints version string or "missing" if not found / command fails
 comp_get_installed_version() {
     key="$1"
-    eval "version_cmd=\$COMP_VERSION_CMD_$key"
-    eval "is_system=\$COMP_IS_SYSTEM_$key"
+    version_cmd=$(comp_db "$key" "version_cmd")
+    is_system=$(comp_db "$key" "is_system")
 
     if [ "$is_system" = "1" ]; then
         if eval "$version_cmd" >/dev/null 2>&1; then
-            eval "$version_cmd" 2>/dev/null | head -1 | sed 's/^[^0-9]*//' | awk '{print $1}'
+            _out=$(eval "$version_cmd" 2>/dev/null | head -1)
+            # An empty probe result means the tool did not actually work.
+            [ -z "$_out" ] && _out="broken"
+            # Only strip a non-numeric prefix when the probe output actually
+            # contains a digit ("curl 7.8.1" -> "7.8.1"); word results like
+            # "present"/"registered" must pass through untouched.
+            case "$_out" in
+                *[0-9]*) printf '%s' "$_out" | sed 's/^[^0-9]*//' | awk '{print $1}' ;;
+                *) printf '%s' "${_out%% *}" ;;
+            esac
         else
             printf "missing"
         fi
     else
-        eval "install_path=\$COMP_INSTALL_PATH_$key"
+        install_path=$(comp_db "$key" "install_path")
         if [ -x "$install_path" ] || [ -f "$install_path" ]; then
             if eval "$version_cmd" >/dev/null 2>&1; then
-                eval "$version_cmd" 2>/dev/null | head -1 | sed 's/^[^0-9]*//' | awk '{print $1}'
+                _out=$(eval "$version_cmd" 2>/dev/null | head -1)
+                [ -z "$_out" ] && _out="broken"
+                # Only strip a non-numeric prefix when the probe output actually
+                # contains a digit ("curl 7.8.1" -> "7.8.1"); word results like
+                # "present"/"registered" must pass through untouched.
+                case "$_out" in
+                    *[0-9]*) printf '%s' "$_out" | sed 's/^[^0-9]*//' | awk '{print $1}' ;;
+                    *) printf '%s' "${_out%% *}" ;;
+                esac
             else
                 printf "broken"
             fi
@@ -131,12 +180,12 @@ comp_get_installed_version() {
 # Get required version - either pinned or fetched dynamically (yt-dlp)
 comp_get_required_version() {
     key="$1"
-    eval "required_version=\$COMP_REQUIRED_VERSION_$key"
-    eval "fetch_url=\$COMP_FETCH_URL_$key"
+    required_version=$(comp_db "$key" "required_version")
+    fetch_url=$(comp_db "$key" "fetch_url")
 
     if [ "$required_version" = "latest" ]; then
         if command -v curl >/dev/null 2>&1; then
-            latest=$(curl -fsSL --max-time 10 "$fetch_url" 2>/dev/null | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+            latest=$(curl -fsSL --max-time 10 "$fetch_url" 2>/dev/null | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/') || latest=""
             if [ -n "$latest" ]; then
                 printf "%s" "$latest"
                 return
@@ -148,32 +197,39 @@ comp_get_required_version() {
     fi
 }
 
+
 # Compare two version strings (semantic-ish).
 # Returns: 0 if v1 == v2, 1 if v1 < v2, 2 if v1 > v2, 3 if incomparable
 comp_compare_versions() {
     v1="$1"; v2="$2"
 
-    case "$v1" in missing|broken|unknown) return 3 ;; esac
-    case "$v2" in missing|broken|unknown) return 3 ;; esac
+    case "$v1" in missing|broken|unknown|"") return 3 ;; esac
+    case "$v2" in missing|broken|unknown|"") return 3 ;; esac
 
     v1=${v1#v}; v2=${v2#v}
     [ "$v1" = "$v2" ] && return 0
 
-    if printf '%s\n%s\n' "$v1" "$v2" | sort -V >/dev/null 2>&1; then
-        first=$(printf '%s\n%s\n' "$v1" "$v2" | sort -V | head -1)
-        [ "$first" = "$v1" ] && return 1 || return 2
-    fi
-
-    case "$v1" in
-        "$v2"*) return 0 ;;
-        *) return 3 ;;
-    esac
+    # Dotted-numeric compare in awk - BSD/macOS sort has no -V, so do not
+    # rely on it. Suffix-only differences (9.0.2 vs 9.0.2-rc1) count as equal,
+    # which is the safe direction: it can never trigger a downgrade.
+    _cmp=$(awk -v a="$v1" -v b="$v2" 'BEGIN {
+        na = split(a, A, /[^0-9]+/); nb = split(b, B, /[^0-9]+/)
+        n = (na > nb) ? na : nb
+        for (i = 1; i <= n; i++) {
+            x = (i <= na) ? A[i] + 0 : 0
+            y = (i <= nb) ? B[i] + 0 : 0
+            if (x < y) { print 1; exit }
+            if (x > y) { print 2; exit }
+        }
+        print 0
+    }') || _cmp=0
+    return "$_cmp"
 }
 
 # Decide action for a component: SKIP, INSTALL, UPDATE, ASK, or FAIL
 comp_decide_action() {
     key="$1"
-    eval "is_system=\$COMP_IS_SYSTEM_$key"
+    is_system=$(comp_db "$key" "is_system")
 
     installed=$(comp_get_installed_version "$key")
     required=$(comp_get_required_version "$key")
@@ -185,8 +241,11 @@ comp_decide_action() {
                 COMP_ACTION_REASON="required system tool not found or not working"
                 ;;
             *)
-                comp_compare_versions "$installed" "$required"
-                cmp=$?
+                if comp_compare_versions "$installed" "$required"; then
+                    cmp=0
+                else
+                    cmp=$?
+                fi
                 if [ $cmp -eq 1 ]; then
                     COMP_ACTION="FAIL"
                     COMP_ACTION_REASON="version $installed < required $required"
@@ -213,8 +272,11 @@ comp_decide_action() {
                 COMP_ACTION="SKIP"
                 COMP_ACTION_REASON="installed version $installed - could not check for updates, keeping it"
             else
-                comp_compare_versions "$installed" "$required"
-                cmp=$?
+                if comp_compare_versions "$installed" "$required"; then
+                    cmp=0
+                else
+                    cmp=$?
+                fi
                 case $cmp in
                     0) COMP_ACTION="SKIP"; COMP_ACTION_REASON="already at required version $required" ;;
                     1) COMP_ACTION="UPDATE"; COMP_ACTION_REASON="installed $installed < required $required" ;;
@@ -234,7 +296,7 @@ comp_print_plan() {
     printf '\n%s%s━━━ INSTALL PLAN ━━━%s\n' "$BOLD" "$WHITE" "$RESET"
     for key in $COMP_NAMES; do
         comp_decide_action "$key"
-        eval "install_path=\$COMP_INSTALL_PATH_$key"
+        install_path=$(comp_db "$key" "install_path")
         installed=$(comp_get_installed_version "$key")
         required=$(comp_get_required_version "$key")
 
@@ -258,71 +320,22 @@ comp_print_plan() {
 }
 
 # Download and verify a component to a temp file
-comp_download_and_verify() {
-    key="$1"
-    eval "fetch_url=\$COMP_FETCH_URL_$key"
-    eval "checksum_url=\$COMP_CHECKSUM_URL_$key"
-    eval "stage_fn=\$COMP_STAGE_FN_$key"
-
-    tmpfile=$(mktemp /tmp/umd-dl-XXXXXX)
-    trap 'rm -f "$tmpfile"' RETURN
-
-    printf '%s[%s]%s %s↓%s Downloading %s...\n' "$DIM" "$(stamp)" "$RESET" "$WHITE" "$RESET" "$key"
-    if ! curl -fsSL --max-time 120 "$fetch_url" -o "$tmpfile"; then
-        die "Failed to download $key from $fetch_url"
-    fi
-
-    if [ -n "$checksum_url" ] && [ "$checksum_url" != "none" ]; then
-        printf '%s[%s]%s %s⟳%s Verifying checksum...\n' "$DIM" "$(stamp)" "$RESET" "$WHITE" "$RESET"
-        expected_sha=$(curl -fsSL --max-time 10 "$checksum_url" 2>/dev/null | grep -E "^[a-fA-F0-9]{64}" | head -1 | awk '{print $1}')
-        if [ -z "$expected_sha" ]; then
-            die "Could not fetch expected checksum for $key from $checksum_url"
-        fi
-        actual_sha=$(sha256sum "$tmpfile" | awk '{print $1}')
-        if [ "$actual_sha" != "$expected_sha" ]; then
-            die "Checksum mismatch for $key: expected $expected_sha, got $actual_sha"
-        fi
-    fi
-
-    chmod +x "$tmpfile" 2>/dev/null || true
-    eval "version_cmd=\$COMP_VERSION_CMD_$key"
-    test_cmd=$(printf '%s' "$version_cmd" | sed "s|.*/\(yt-dlp\|deno\|ffmpeg\|ffprobe\|python3\)|$tmpfile|")
-    if ! eval "$test_cmd" >/dev/null 2>&1; then
-        die "Downloaded $key fails version probe (may be corrupt or wrong arch)"
-    fi
-
-    COMP_TEMP_FILE="$tmpfile"
-    trap - RETURN
-}
-
 # Install component atomically from temp file
-comp_install_component() {
-    key="$1"
-    eval "install_path=\$COMP_INSTALL_PATH_$key"
-    eval "stage_fn=\$COMP_STAGE_FN_$key"
-
-    mkdir -p "$(dirname "$install_path")"
-    newpath="${install_path}.new"
-    cp "$COMP_TEMP_FILE" "$newpath"
-    chmod +x "$newpath" 2>/dev/null || true
-    mv -f "$newpath" "$install_path"
-
-    installed=$(comp_get_installed_version "$key")
-    stamp_dir=$(dirname "$install_path")
-    printf '%s\n' "$installed" > "$stamp_dir/.umd-version-$key"
-}
-
 # Write stamp only for components that changed this run
 comp_write_stamp_if_changed() {
     key="$1"
-    eval "install_path=\$COMP_INSTALL_PATH_$key"
+    install_path=$(comp_db "$key" "install_path")
     stamp_dir=$(dirname "$install_path")
     installed=$(comp_get_installed_version "$key")
     printf '%s\n' "$installed" > "$stamp_dir/.umd-version-$key"
 }
 
 # Byte-compare source and destination, copy only if different
-comp_sync_file() {
+# Byte-compare source and destination, copy only if different.
+# The body runs in a subshell ( ... ) so its variables never clobber the
+# caller's loop variables - plain { ... } scoping corrupted the extension
+# sync loop (icons after the first were written to nonsense paths).
+comp_sync_file() (
     src="$1"; dst="$2"
     if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
         return 1
@@ -330,7 +343,7 @@ comp_sync_file() {
     mkdir -p "$(dirname "$dst")"
     cp "$src" "$dst"
     return 0
-}
+)
 
 # Check if a folder is recognizably ours (has our marker file)
 comp_is_our_folder() {
@@ -348,7 +361,7 @@ YT_DLP_BIN="$BACKEND/bin/yt-dlp"
 DENO_BIN="$BACKEND/bin/deno"
 FFMPEG_BIN="$BACKEND/bin/ffmpeg"
 FFPROBE_BIN="$BACKEND/bin/ffprobe"
-PYTHON_BIN="$BACKEND/python/bin/python3"
+PYTHON_BIN="$BACKEND/runtime/python/bin/python3"
 BRIDGE_DIR="$BACKEND/bridge"
 SRC="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 
@@ -365,10 +378,10 @@ comp_register "curl" \
 # Our managed components
 comp_register "yt-dlp" \
     "$YT_DLP_BIN" \
-    "$YT_DLP_BIN --version" \
+    "$BACKEND/runtime/python/bin/python3 $YT_DLP_BIN --version" \
     "latest" \
     "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest" \
-    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA256SUMS" \
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS" \
     "0" "stage_ytdlp"
 
 comp_register "deno" \
@@ -408,7 +421,7 @@ comp_register "bridge-files" \
 
 comp_register "browser-registration" \
     "$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.umd.bridge.rc.json" \
-    "test -f \$HOME/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/com.umd.bridge.rc.json && echo registered || echo missing" \
+    "test -f \$HOME/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/com.umd.bridge.rc.json && test -f \$HOME/Library/Application\ Support/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.umd.bridge.rc.json && echo registered || echo missing" \
     "registered" \
     "" "" \
     "0" "stage_register"
@@ -479,75 +492,60 @@ animated_banner() {
   # If animation not supported, use static banner
   term_supports_animation || { banner; return 0; }
 
+  # Split the art into positional parameters (newline-separated). No pipeline
+  # is used: a piped while-loop would run in a subshell and lose the values.
+  # No arrays and no eval: both are unnecessary here, and eval corrupted the
+  # trailing backslash of the second art line.
+  art_lines='    ___    __  _______
+   /   |  /  |/  / __ \
+  / /| | / /|_/ / / / /
+ / ___ |/ /  / / /_/ /
+/_/  |_|_/  /_/_____/'
+  _ifs=$IFS; IFS='
+'
+  set -f
+  set -- $art_lines
+  set +f
+  IFS=$_ifs
+  art_count=$#
+
   # Hide cursor during animation
   printf '%s[?25l' "$ESC"
 
-  # The ASCII art lines
-  art_lines="
-    ___    __  _______
-   /   |  /  |/  / __ \\
-  / /| | / /|_/ / / / /
- / ___ |/ /  / / /_/ /
-/_/  |_/_/  /_/_____/
-"
+  # One gentle left-to-right gradient sweep, then it settles (static final frame).
+  total_frames=30
+  frame_delay=0.05
 
-  # Animation parameters
-  total_frames=35
-  frame_delay=0.04  # ~40ms per frame = ~1.4s total
-
-  # Get the art lines into an array
-  line_idx=0
-  printf '%s' "$art_lines" | while IFS= read -r line; do
-    [ -n "$line" ] && eval "art_line_$line_idx=\"$line\"" && line_idx=$((line_idx + 1))
-  done
-  art_line_count=$line_idx
-
-  # For each frame, progressively reveal the gradient
   frame=0
   while [ $frame -le $total_frames ]; do
-    # Clear the art area (move up and clear lines)
     if [ $frame -gt 0 ]; then
-      printf '%s[%dA' "$ESC" $((art_line_count + 3))  # +3 for blank + title + byline
+      # redraw over the previous frame (art lines + title + byline)
+      printf '%s[%sA' "$ESC" $((art_count + 2))
     fi
-
-    # Calculate progress (0.0 to 1.0)
     progress=$(awk -v f="$frame" -v t="$total_frames" 'BEGIN { printf "%.3f", f/t }')
-
-    # Render each line with gradient sweep
-    i=0
-    while [ $i -lt $art_line_count ]; do
-      eval "line=\$art_line_$i"
-      len=${#line}
-      # Sweep position: how many characters should be "lit up"
-      sweep_pos=$(awk -v p="$progress" -v l="$len" 'BEGIN { printf "%d", p * l }')
-      
-      # Print line with gradient up to sweep_pos, dim after
-      char_idx=0
-      while [ $char_idx -lt $len ]; do
-        ch=$(printf '%s' "$line" | cut -c $((char_idx + 1)))
-        if [ $char_idx -lt $sweep_pos ]; then
-          # In gradient zone - use position-based color
-          seg=$(( char_idx * 5 / len ))
-          case $seg in
-            0) c=$G1 ;; 1) c=$G2 ;; 2) c=$G3 ;; 3) c=$G4 ;; *) c=$G5 ;;
-          esac
-          printf '%s%s' "$c" "$ch"
-        else
-          # Not yet reached - dim
-          printf '%s%s' "$DIM" "$ch"
-        fi
-        char_idx=$((char_idx + 1))
-      done
-      printf '%s\n' "$RESET"
-      i=$((i + 1))
+    for line do
+      # one awk per line paints each character: gradient up to the sweep
+      # position, dim beyond it
+      printf '%s\n' "$line" | awk -v p="$progress" \
+        -v g1="$G1" -v g2="$G2" -v g3="$G3" -v g4="$G4" -v g5="$G5" \
+        -v dim="$DIM" -v rst="$RESET" '{
+        n = length($0); lit = int(p * n + 0.5)
+        for (i = 1; i <= n; i++) {
+          ch = substr($0, i, 1)
+          if (i <= lit) {
+            s = int((i - 1) * 5 / n)
+            c = (s == 0) ? g1 : (s == 1) ? g2 : (s == 2) ? g3 : (s == 3) ? g4 : g5
+            printf "%s%s", c, ch
+          } else {
+            printf "%s%s", dim, ch
+          }
+        }
+        printf "%s\n", rst
+      }'
     done
-
-    # Title and byline (static, full color)
     printf '%s%sARYZEN Media Downloader%s\n' "$BOLD" "$WHITE" "$RESET"
     printf '%screated by Aryzen Nex%s\n' "$PURPLE" "$RESET"
-
     frame=$((frame + 1))
-    # Sleep using portable method
     sleep "$frame_delay" 2>/dev/null || sleep 1 2>/dev/null || true
   done
 
@@ -566,7 +564,7 @@ animated_banner() {
 # animation the author linked (lottiefiles.com/free-animation/loading-99FrBcVjYZ);
 # no Lottie asset, code or license material is used - the spinner is a plain
 # terminal convention drawn from scratch in the AMD gradient colors.
-STAGE_TOTAL=9
+STAGE_TOTAL=8
 STEPN=0
 HIST=0
 SAVE="$ESC"7
@@ -639,7 +637,6 @@ stage() {
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 BACKEND="$HOME/.universal-media-downloader-rc"
 DESKDIR="$HOME/Desktop/ARYZEN Media Downloader"
-TMPF=$(mktemp -d)
 
 # Stage 0: Print the install plan (what will be SKIP/INSTALL/UPDATE)
 stage_check_plan() {
@@ -648,16 +645,14 @@ stage_check_plan() {
     for key in $COMP_NAMES; do
         comp_decide_action "$key"
         if [ "$COMP_ACTION" = "FAIL" ]; then
-            eval "install_path=\$COMP_INSTALL_PATH_$key"
             installed=$(comp_get_installed_version "$key")
             required=$(comp_get_required_version "$key")
             die "$key: $COMP_ACTION_REASON (found=$installed required=$required)"
         fi
         if [ "$COMP_ACTION" = "ASK" ]; then
-            eval "install_path=\$COMP_INSTALL_PATH_$key"
             installed=$(comp_get_installed_version "$key")
             required=$(comp_get_required_version "$key")
-            printf '%s[%s]%s %s!%s %s: installed %s > required %s. Keep newer (k) or install pinned (i)? ' \
+            printf '%s[%s]%s %s!%s %s: installed %s > required %s. Keep installed (k) or install pinned (i)? ' \
                 "$DIM" "$(stamp)" "$RESET" "$PURPLE" "$RESET" "$key" "$installed" "$required"
             read -r choice
             case "$choice" in
@@ -711,7 +706,7 @@ stage_ytdlp() {
     echo "could not reach GitHub - check your internet connection and run this again."
     return 1
   fi
-  WANT=$(curl -fsSL --max-time 10 "https://github.com/yt-dlp/yt-dlp/releases/download/$TAG/SHA256SUMS" | awk '$2=="yt-dlp"{print $1}') || true
+  WANT=$(curl -fsSL --max-time 10 "https://github.com/yt-dlp/yt-dlp/releases/download/$TAG/SHA2-256SUMS" | awk '$2=="yt-dlp"{print $1}') || true
   if [ -z "$WANT" ]; then
     echo "could not read the official yt-dlp checksum."
     return 1
@@ -883,6 +878,7 @@ stage_helper() {
 
   comp_decide_action "python"
   if [ "$COMP_ACTION" = "INSTALL" ] || [ "$COMP_ACTION" = "UPDATE" ]; then
+    rm -rf "$BACKEND/runtime/python"
     cp -R "$TMPF/python" "$BACKEND/runtime/python"
     comp_write_stamp_if_changed "python"
     echo "  installed: python runtime"
@@ -893,47 +889,34 @@ stage_helper() {
 }
 
 stage_register() {
-  comp_decide_action "browser-registration"
-  case "$COMP_ACTION" in
-    SKIP)
-      echo "SKIP: browser-registration already present ($COMP_ACTION_REASON)"
-      return 0
-      ;;
-    INSTALL|UPDATE)
-      ;;
-    *)
-      echo "SKIP: browser-registration ($COMP_ACTION_REASON)"
-      return 0
-      ;;
-  esac
-
+  # Idempotent: write the host manifest wherever it is missing or outdated.
+  sed "s|HOST_LAUNCHER_PATH|$BACKEND/bridge/run-host.sh|" "$SRC/bridge/com.umd.bridge.rc.json" > "$TMPF/com.umd.bridge.rc.json"
+  _reg_changed=0
   for D in "$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts" \
            "$HOME/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts"; do
     mkdir -p "$D"
-    sed "s|HOST_LAUNCHER_PATH|$BACKEND/bridge/run-host.sh|" "$SRC/bridge/com.umd.bridge.rc.json" > "$D/com.umd.bridge.rc.json"
+    if comp_sync_file "$TMPF/com.umd.bridge.rc.json" "$D/com.umd.bridge.rc.json"; then
+      _reg_changed=1
+      echo "  updated: $D/com.umd.bridge.rc.json"
+    fi
   done
-  echo "registered with Chrome and Brave (com.umd.bridge.rc)"
+  if [ "$_reg_changed" = "1" ]; then
+    echo "registered with Chrome and Brave (com.umd.bridge.rc)"
+  else
+    echo "browser registration already up to date (com.umd.bridge.rc)"
+  fi
 }
 
 stage_desktop() {
-  comp_decide_action "extension-folder"
-  case "$COMP_ACTION" in
-    SKIP)
-      if [ -e "$DESKDIR" ] && comp_is_our_folder "$DESKDIR"; then
-        echo "SKIP: extension-folder already present ($COMP_ACTION_REASON)"
-        return 0
-      fi
-      ;;
-    INSTALL|UPDATE)
-      ;;
-    *)
-      echo "SKIP: extension-folder ($COMP_ACTION_REASON)"
-      return 0
-      ;;
-  esac
-
-  mkdir -p "$HOME/Desktop"
-  mkdir -p "$DESKDIR"
+  # Never touch a folder we did not create.
+  if [ -e "$DESKDIR" ] && ! comp_is_our_folder "$DESKDIR"; then
+    echo "$DESKDIR already exists and was not created by this installer - not touching it."
+    return 1
+  fi
+  # Idempotent sync: copy only files that differ, so rerunning the installer
+  # after editing the extension updates the Desktop copy in place.
+  mkdir -p "$HOME/Desktop" "$DESKDIR"
+  _synced=0
   for src in "$SRC/extension/"*; do
     [ -e "$src" ] || continue
     base=$(basename "$src")
@@ -943,13 +926,13 @@ stage_desktop() {
       for f in "$src/"*; do
         [ -e "$f" ] || continue
         fb=$(basename "$f")
-        comp_sync_file "$f" "$dst/$fb"
+        if comp_sync_file "$f" "$dst/$fb"; then _synced=$((_synced + 1)); fi
       done
     else
-      comp_sync_file "$src" "$dst"
+      if comp_sync_file "$src" "$dst"; then _synced=$((_synced + 1)); fi
     fi
   done
-  cat > "$DESKDIR/README-FIRST.txt" <<'NOTE'
+  cat > "$TMPF/README-FIRST.txt" <<'NOTE'
 ARYZEN Media Downloader - created by Aryzen Nex
 
 This folder is the browser extension. The download engine and bridge were
@@ -972,14 +955,20 @@ from brave://extensions / chrome://extensions.
 If macOS ever refuses to run the bundled FFmpeg, right-click it in Finder
 and choose Open once.
 NOTE
+  if comp_sync_file "$TMPF/README-FIRST.txt" "$DESKDIR/README-FIRST.txt"; then _synced=$((_synced + 1)); fi
   touch "$DESKDIR/.umd-rc"
-  echo "project folder ready on your Desktop"
+  if [ "$_synced" -gt 0 ]; then
+    echo "project folder on your Desktop updated ($_synced file(s) synced)"
+  else
+    echo "project folder on your Desktop already up to date"
+  fi
 }
 
 animated_banner
 
+stage_check_plan
+
 printf '%s%sCurrently at step 1/%s%s\n\n' "$WHITE" "$BOLD" "$STAGE_TOTAL" "$RESET"
-stage "Checking what's already installed" stage_check_plan
 stage "Checking your setup" stage_check
 stage "Downloading the yt-dlp engine (latest official release)" stage_ytdlp
 stage "Downloading the Deno JavaScript runtime (needed for YouTube)" stage_deno

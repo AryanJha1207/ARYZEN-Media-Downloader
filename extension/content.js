@@ -445,7 +445,7 @@
     // The floating pill carries the user's ARYZEN vector art (the same A
     // artwork as the menu's raised tab); the anchored YouTube-row button
     // keeps the plain download arrow that matches that row's own icons.
-    b.innerHTML = (anchored ? ICON_SVG : '<img src="' + chrome.runtime.getURL("icons/tab-mark.png") + '" alt="" aria-hidden="true" style="height:20px;width:auto;display:block;filter:brightness(0) invert(1)">') + "<span>Download</span>";
+    b.innerHTML = (anchored ? ICON_SVG : '<img src="' + chrome.runtime.getURL("icons/tab-mark.png") + '" alt="" aria-hidden="true" style="height:20px;width:auto;display:block;margin:0;filter:brightness(0) invert(1)">') + "<span>Download</span>";
     b.style.position = b.style.position || "relative";
     for (const child of [b.querySelector("svg"), b.querySelector("img"), b.querySelector("span")]) {
       if (child) { child.style.position = "relative"; child.style.zIndex = "1"; }
@@ -831,6 +831,26 @@
       font-family: inherit;
     }
     select.umd-quality option, select.umd-quality optgroup { background: #0b1130; color: #f2f6ff; }
+    .umd-destwrap { position: relative; margin-top: auto; }
+    .umd-destrow { display: flex; gap: 8px; }
+    input.umd-dest {
+      flex: 1; min-width: 0; height: 40px; color-scheme: dark;
+      background: var(--well); color: var(--text); border: 1px solid var(--edge); box-shadow: var(--well-inset);
+      border-radius: 12px; padding: 0 12px; font-size: 13px; font-weight: 600; font-family: inherit; outline: none;
+      transition: border-color .15s ease, box-shadow .15s ease;
+    }
+    input.umd-dest:hover { border-color: rgba(120,190,255,.50); }
+    input.umd-dest:focus { border-color: var(--sky); box-shadow: var(--well-inset), var(--ring); }
+    .umd-destbtn { flex: none; width: 40px; height: 40px; border-radius: 12px; background: var(--well); border: 1px solid var(--edge); color: var(--text2); cursor: pointer; font-size: 15px; line-height: 1; }
+    .umd-destbtn:hover { border-color: rgba(120,190,255,.50); color: var(--text); }
+    .umd-destlist {
+      position: absolute; z-index: 5;
+      background: #0b1130; border: 1px solid var(--edge); border-radius: 12px;
+      overflow: hidden auto; max-height: 176px; box-shadow: 0 12px 32px rgba(0,0,0,.45);
+    }
+    .umd-destitem { display: block; width: 100%; text-align: left; background: none; border: 0; color: var(--text); padding: 10px 14px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
+    .umd-destitem:hover, .umd-destitem:focus-visible { background: rgba(120,190,255,.12); outline: none; }
+    .umd-destitem .sub { display: block; font-size: 11px; font-weight: 500; color: var(--text2); margin-top: 2px; }
     select.umd-quality:hover { border-color: rgba(120,190,255,.50); }
     select.umd-quality:focus { border-color: var(--sky); box-shadow: var(--well-inset), var(--ring); }
     .umd-save {
@@ -1088,12 +1108,43 @@
               uploader: user ? "@" + user : "", site: "Instagram",
               thumbnail: cand ? cand.url : "", duration: vid.video_duration || 0 } };
   }
+  // A public post the page itself renders carries its streams in the post's
+  // own player element. This reads only what the page already shows (no auth,
+  // no extra requests) and accepts only https URLs on Reddit's media hosts.
+  function redditDomMedia(doc, postId) {
+    // Bind to the REQUESTED post, never to a feed or comment-embed video:
+    // shreddit-post carries the fullname t3_<id> of the post it renders.
+    const sel = postId ? 'shreddit-post[id="t3_' + postId + '"]' : "shreddit-post";
+    const post = doc.querySelector(sel);
+    if (!post) return null;
+    const player = post.querySelector("shreddit-player");
+    if (!player) return null;
+    let data = null;
+    try { data = JSON.parse(player.getAttribute("packaged-media") || "null"); } catch (e) { return null; }
+    if (!data || typeof data !== "object") return null;
+    const okUrl = (x) => /^https:\/\/([a-z0-9-]+\.)*(v\.redd\.it|reddit\.com|redd\.it|redditmedia\.com|redditstatic\.com)(\/|$)/i.test(x || "");
+    const hls = okUrl(data.hlsUrl) ? data.hlsUrl : "";
+    const perms = (data.playbackMp4s || {}).permutations;
+    const mp4s = (Array.isArray(perms) ? perms : [])
+      .map((pm) => ({ url: ((pm || {}).source || {}).url || "", height: ((pm || {}).source || {}).height || 0 }))
+      .filter((v) => v.url && okUrl(v.url))
+      .sort((a, b) => b.height - a.height);
+    if (!hls && !mp4s.length) return null;
+    return { hls, mp4s, title: (post.getAttribute("post-title") || "").trim() };
+  }
+
   async function redditResolve(url, timeoutMs, onWorking) {
     const u = new URL(url);
     if (u.hostname !== location.hostname || !/\/comments\/\w+/.test(u.pathname)) return null;
-    const r = await fetch(u.origin + u.pathname.replace(/\/?$/, "/") + ".json?raw_json=1",
-      { credentials: "include", headers: { Accept: "application/json" } });
-    if (!r.ok) return null;
+    let r = null;
+    try {
+      r = await fetch(u.origin + u.pathname.replace(/\/?$/, "/") + ".json?raw_json=1",
+        { credentials: "include", headers: { Accept: "application/json" } });
+    } catch (e) { r = null; }
+    if (r && r.ok) {
+      // Any unusable payload (invalid JSON, missing post, no media) falls
+      // through to the DOM fallback below instead of failing outright.
+      const j = await (async () => {
     let post = (((await r.json())[0] || {}).data || {}).children;
     post = post && post[0] && post[0].data;
     if (!post) return null;
@@ -1108,7 +1159,7 @@
     const mediaUrl = post.url_overridden_by_dest || post.url;
     if (mediaUrl && /\.(jpg|jpeg|png|webp)(\?|$)/i.test(mediaUrl)) {
       return { ok: true, resolvedUrl: url, useName: true, info,
-        options: [{ id: "img-direct", kind: "image", label: "Image (HD)", selector: "b", url: mediaUrl.split("?")[0] }] };
+        options: [{ id: "img-direct", kind: "image", label: "Image (HD)", selector: "b", url: mediaUrl }] };
     }
 
     const rv = (post.secure_media && post.secure_media.reddit_video) ||
@@ -1126,7 +1177,33 @@
     if (rv.fallback_url) { // silent clip / GIF: one plain mp4
       const h = rv.height || 0;
       return { ok: true, resolvedUrl: url, useName: true, info,
-        options: [{ id: "v-direct", kind: "video", label: (h ? h + "p" : "Video") + " (no audio track)", selector: "b", url: rv.fallback_url.split("?")[0] }] };
+        options: [{ id: "v-direct", kind: "video", label: (h ? h + "p" : "Video") + " (no audio track)", selector: "b", url: rv.fallback_url }] };
+    }
+    return null;
+      })().catch(() => null);
+      if (j) return j;
+    }
+    // The .json read failed (Reddit often refuses anonymous API reads with an
+    // IP-level wall). Fall back to the media the rendered page itself carries.
+    const postId = (u.pathname.match(/\/comments\/(\w+)/) || [])[1] || "";
+    const dom = redditDomMedia(document, postId);
+    if (dom) {
+      const sub = (u.pathname.match(/\/r\/([^/]+)/) || [])[1] || "";
+      const info = { title: dom.title || "Reddit post", site: "Reddit", thumbnail: "",
+                     duration: 0, uploader: sub ? "r/" + sub : "" };
+      // Prefer HLS: Reddit's plain mp4s are video-only, HLS carries audio.
+      if (dom.hls) {
+        const pr = await send("probe", { url: dom.hls }, timeoutMs, onWorking);
+        if (pr && pr.ok && (pr.options || []).length) {
+          return Object.assign({}, pr, { info: Object.assign({}, pr.info, info), resolvedUrl: dom.hls, useName: true });
+        }
+      }
+      if (dom.mp4s.length) {
+        return { ok: true, resolvedUrl: url, useName: true, info,
+          options: dom.mp4s.slice(0, 4).map((v) => ({ id: "v-dom-" + (v.height || "x"), kind: "video",
+            label: (v.height ? v.height + "p" : "Video") + " (no audio track)", selector: "b",
+            url: v.url })) };
+      }
     }
     return null;
   }
@@ -1157,8 +1234,24 @@
         const doc = new DOMParser().parseFromString(await r.text(), "text/html");
         const meta = (p) => { const e = doc.querySelector('meta[property="' + p + '"]'); return e ? (e.content || "").trim() : ""; };
         const title = meta("og:title");
-        if (title) return { title, thumb: meta("og:image"),
-          artist: (meta("og:description").split(" \u00b7 ")[0] || "").split(",")[0].trim() };
+        if (title) {
+          // The embed page's data block carries the exact track length and
+          // full artist list; the bridge uses both to reject wrong uploads.
+          let duration = 0, artists = "";
+          const spAbort = new AbortController();
+          const spTimer = setTimeout(() => spAbort.abort(), 8000);
+          try {
+            const etxt = await (await fetch("/embed/track/" + m[1], { credentials: "omit", signal: spAbort.signal })).text();
+            const em = etxt.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+            const ent = em ? ((((JSON.parse(em[1]).props || {}).pageProps || {}).state || {}).data || {}).entity : null;
+            if (ent) {
+              if (ent.duration) duration = Math.round(ent.duration / 1000);
+              if (ent.artists) artists = ent.artists.map((a) => (a && a.name) || "").filter(Boolean).join(", ");
+            }
+          } catch (e) {} finally { clearTimeout(spTimer); }
+          return { title, thumb: meta("og:image"), duration, artists,
+            artist: (meta("og:description").split(" \u00b7 ")[0] || "").split(",")[0].trim() };
+        }
       } catch (e) {}
     }
     try {
@@ -1557,6 +1650,13 @@
       renderFoot("", [ghostBtn("Close", close), primaryBtn("Try again", boot)]);
     }
 
+    function saveDestState() {
+      try {
+        chrome.runtime.sendMessage({ to: "umd-dest-set",
+          state: { dest: st.dest || "", saveAsOnce: !!st.saveAsOnce } });
+      } catch (e) {}
+    }
+
     function showReady() {
       st.phase = "ready";
       setPasteEnabled(true);
@@ -1600,10 +1700,82 @@
       selWrap.appendChild(sel);
       right.appendChild(selWrap);
 
-      const save = el("div", "umd-save");
-      save.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
-        '<path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="#8fb8ff" stroke-width="1.7" stroke-linejoin="round"/></svg>';
-      right.appendChild(save);
+      // Destination bar: default Downloads/AMD/<Site>; type a folder, pick a
+      // previously used one, or ask for the browser's Save dialog each time.
+      // A custom choice lives in the background worker keyed by THIS tab's id:
+      // it survives reloads and navigation in this tab, is wiped when the tab
+      // closes, is never shared with other tabs, and is never a saved default.
+      right.appendChild(el("div", "umd-label", "Save to"));
+      const destWrap = el("div", "umd-destwrap");
+      const destRow = el("div", "umd-destrow");
+      const destIn = document.createElement("input");
+      destIn.className = "umd-dest";
+      destIn.setAttribute("aria-label", "Download destination folder");
+      destIn.value = st.dest || ("Downloads/AMD/" + site.name);
+      destIn.spellcheck = false;
+      destIn.addEventListener("input", () => { st.dest = destIn.value; st.saveAsOnce = false; saveDestState(); });
+      const destBtn = el("button", "umd-destbtn", "\u25BE");
+      destBtn.type = "button";
+      destBtn.setAttribute("aria-label", "Choose a previous destination");
+      const destList = el("div", "umd-destlist");
+      destList.style.display = "none";
+      function fillDestList() {
+        destList.innerHTML = "";
+        (st.destRecents || []).forEach((d) => {
+          const it = el("button", "umd-destitem", d);
+          it.type = "button";
+          it.addEventListener("click", () => {
+            st.saveAsOnce = false; st.dest = d;
+            destIn.value = d; destList.style.display = "none"; saveDestState();
+          });
+          destList.appendChild(it);
+        });
+        const ask = el("button", "umd-destitem", "Ask each time");
+        ask.type = "button";
+        ask.appendChild(el("span", "sub", "Browser Save dialog picks the folder"));
+        ask.addEventListener("click", () => {
+          st.saveAsOnce = true;
+          destIn.value = "Ask each time (Save dialog)";
+          destList.style.display = "none"; saveDestState();
+        });
+        destList.appendChild(ask);
+      }
+      // The list lives on .umd-content while open: .umd-body clips absolutely
+      // positioned children (overflow-y: auto), which cut the dropdown off in
+      // both directions. Positioned from the wrap's real rect, opening upward
+      // so the card's own silhouette never clips it either.
+      function openDestList() {
+        fillDestList();
+        content.appendChild(destList);
+        destList.style.display = "block";
+        const wr = destWrap.getBoundingClientRect();
+        const cr = content.getBoundingClientRect();
+        destList.style.left = (wr.left - cr.left) + "px";
+        destList.style.width = wr.width + "px";
+        destList.style.right = "auto"; destList.style.bottom = "auto";
+        destList.style.top = Math.max(8, wr.top - cr.top - 6 - destList.offsetHeight) + "px";
+      }
+      destBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (destList.style.display === "none") openDestList();
+        else destList.style.display = "none";
+      });
+      shadow.addEventListener("click", () => { destList.style.display = "none"; });
+      destRow.append(destIn, destBtn);
+      destWrap.append(destRow, destList);
+      right.appendChild(destWrap);
+      // The history of destinations AMD actually used arrives after the menu
+      // is drawn; it fills only the dropdown, never the field's default.
+      try {
+        chrome.storage.local.get(["umdDests"], (r) => {
+          if (r && r.umdDests) st.destRecents = r.umdDests;
+        });
+        chrome.runtime.sendMessage({ to: "umd-dest-get" }, (r) => {
+          if (!r || !r.ok || !r.state) return;
+          if (r.state.dest) { st.dest = r.state.dest; destIn.value = r.state.dest; }
+          if (r.state.saveAsOnce) { st.saveAsOnce = true; destIn.value = "Ask each time (Save dialog)"; }
+        });
+      } catch (e) {}
 
       main.append(left, right);
       body.appendChild(main);
@@ -1640,7 +1812,7 @@
       renderFoot("", [ghostBtn("Cancel", cancelJob)]);
     }
 
-    function showDone(file, filePath) {
+    function showDone(file, filePath, pd) {
       st.phase = "done";
       setPasteEnabled(true);
       body.innerHTML = "";
@@ -1669,20 +1841,27 @@
         pathDiv.style.overflow = "hidden";
         pathDiv.style.textOverflow = "ellipsis";
         pathDiv.style.whiteSpace = "nowrap";
-        // Show just the filename with folder indicator
+        // Custom destinations land outside ~/Downloads; show the real folder.
         const filename = filePath.split("/").pop() || filePath;
-        pathDiv.textContent = "📁 ~/Downloads/" + filename;
+        const dir = filePath.slice(0, filePath.length - filename.length).replace(/\/$/, "");
+        pathDiv.textContent = "📁 " + (dir ? dir + "/" + filename : "~/Downloads/" + filename);
         pathDiv.title = filePath; // Full path on hover
         w.append(pathDiv);
+      } else if (pd && pd.saveAs) {
+        w.append(el("div", "umd-donefile", "📁 Saved where you chose: " + file));
+      } else if (pd && pd.label && file) {
+        // "Downloads/..." here is the browser's download folder, which the
+        // user may have pointed somewhere other than the OS Downloads folder.
+        w.append(el("div", "umd-donefile", "📁 " + pd.label + "/" + file));
       } else if (file) {
-        w.append(el("div", "umd-donefile", "📁 ~/Downloads/" + file));
+        w.append(el("div", "umd-donefile", "📁 Downloads/" + file));
       } else {
         w.append(el("div", "umd-donefile", "Saved to " + st.downloadDir));
       }
 
       body.appendChild(w);
       renderFoot("", [
-        primaryBtn("Open Folder", () => send("open-downloads")),
+        primaryBtn("Open Folder", () => send("open-downloads", filePath ? { path: filePath.replace(/[\\/][^\\/]*$/, "") } : null)),
         ghostBtn("Show in Chrome", () => chrome.runtime.sendMessage({ to: "bridge", cmd: "open-downloads-tab" })),
         ghostBtn("Close", close)
       ]);
@@ -1706,6 +1885,8 @@
         if (t) {
           st.spQuery = (t.artist ? t.artist + " " : "") + t.title;
           st.spTitle = t.title;
+          st.spArtist = t.artist || "";
+          st.spDuration = t.duration || 0;
         }
       }
 
@@ -1715,12 +1896,37 @@
         return;
       }
 
+      // Destination routing: "Downloads/..."-style relative folders are saved
+      // by the browser into its download directory; absolute folders are
+      // placed directly by the local helper; "Ask each time" uses the
+      // browser's Save dialog for this download.
+      let destAbs = "", subdir = "";
+      const saveAs = !!st.saveAsOnce;
+      let destLabel = "";
+      if (!saveAs) {
+        let v = String(st.dest || "").trim().replace(/\s+/g, " ").replace(/\/+$/, "");
+        if (!v) v = "Downloads/AMD/" + site.name;
+        destLabel = v;
+        if (/^~?[\/]/.test(v) || /^[A-Za-z]:[\\/]/.test(v)) destAbs = v;
+        else if (/^Downloads$/i.test(v)) subdir = "";  // Downloads root itself
+        else subdir = v.replace(/^Downloads\//i, "") || ("AMD/" + site.name);
+      }
+      if (destAbs && !st.destSupport) {
+        // An older helper silently ignores "dest" and would save to the wrong
+        // folder; refuse visibly instead of starting that download.
+        showError("Saving to a typed folder needs the latest AMD helper. Run the setup script once more to update it, then try again.");
+        return;
+      }
+      st.pendingDest = { subdir, saveAs, label: saveAs ? "" : destLabel };
       showProgress();
       const r = SPOTIFY
         ? await send("song", { query: st.spQuery, title: st.spTitle,
+            artist: st.spArtist || "", duration: st.spDuration || 0,
+            dest: destAbs,
             kind: o.kind === "video" ? "video" : "audio-mp3", mp3: o.mp3 || 0, height: o.height || 0 })
         : await send("download", {
             url: o.url || st.url || location.href, kind: o.kind, selector: o.selector || "", mp3: o.mp3 || 0,
+            dest: destAbs,
             name: st.useName ? ((st.info && st.info.title) || "") : "",
           });
       if (!r.ok) { showError(r.error || "Download failed to start."); return; }
@@ -1741,8 +1947,27 @@
           : "Downloading\u2026";
       } else if (g.type === "done") {
         st.job = null;
-        showDone(g.file, g.path);
-        if (g.url) chrome.runtime.sendMessage({ to: "save-file", url: g.url, name: g.file });
+        const pd = st.pendingDest || {};
+        // A staged path is the helper's private temp folder - never show it.
+        // Browser-saved files show the folder the user actually picked;
+        // helper-placed files show their real absolute folder.
+        showDone(g.file, g.placed ? g.path : null, pd);
+        if (g.url) chrome.runtime.sendMessage({ to: "save-file", url: g.url, name: g.file,
+          subdir: pd.subdir || "", saveAs: !!pd.saveAs, label: pd.label || "", job: g.job || "" });
+        // Destination history: browser-saved downloads are recorded by the
+        // background worker only after the save COMPLETES; a helper-placed
+        // file is already in its folder here, so it counts as saved now.
+        if (pd.label && g.placed) {
+          try {
+            chrome.storage.local.get(["umdDests"], (rr) => {
+              const list = [pd.label].concat(((rr && rr.umdDests) || []).filter((d) => d !== pd.label)).slice(0, 8);
+              chrome.storage.local.set({ umdDests: list });
+            });
+          } catch (e) {}
+        }
+        if (pd.label) st.dest = pd.label;
+        st.saveAsOnce = false; st.pendingDest = null;
+        saveDestState();
       } else if (g.type === "error") {
         st.job = null;
         if (st.phase === "downloading") showError(g.error || "Download failed.");
@@ -1819,6 +2044,8 @@
       // Delay setting spQuery until download is clicked
       st.spQuery = null;
       st.spTitle = t.title;
+      st.spArtist = t.artist || "";
+      st.spDuration = t.duration || 0;
       st.url = "spotify:track";
       st.urlIsPage = false; // Important: prevents navWatch from closing the menu since we don't use the page URL
       st.info = { title: t.title, uploader: t.artist, site: "Spotify", thumbnail: t.thumb || "" };
@@ -1862,6 +2089,7 @@
           if (st.phase !== "ready" && st.phase !== "downloading") return;
           if (!ping.ok) { showSetupError(ping.error || "no answer"); return; }
           if (ping.download_dir) st.downloadDir = ping.download_dir;
+          st.destSupport = !!ping.dest_support;
         });
         return;
       }
@@ -1872,6 +2100,7 @@
       const ping = await pingP;
       if (!ping.ok) { showSetupError(ping.error || "no answer"); return; }
       if (ping.download_dir) st.downloadDir = ping.download_dir;
+      st.destSupport = !!ping.dest_support;
     }
 
     boot();

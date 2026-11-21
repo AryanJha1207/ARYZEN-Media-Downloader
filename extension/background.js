@@ -14,7 +14,8 @@ let seq = 0;
 // (no externally_connectable), so every page-side command also requires a
 // real click on our own button inside our own content script.
 const ALLOWED_CMDS = new Set(["ping", "versions", "probe", "download",
-  "cancel", "song", "open-downloads", "open-downloads-tab", "update-engine", "bridge-state"]);
+  "cancel", "song", "open-downloads", "open-downloads-tab", "update-engine", "bridge-state",
+  "discard-staged"]);
 const PAGE_HOSTS = /(^|\.)(youtube\.com|instagram\.com|reddit\.com|twitch\.tv|soundcloud\.com|spotify\.com|streamable\.com|ted\.com)$/i;
 
 let keepalive = null;
@@ -74,12 +75,82 @@ function ensurePort() {
   return true;
 }
 
+chrome.tabs.onRemoved.addListener((tabId) => {
+  umdTabs.delete(tabId);
+  try { chrome.storage.session.remove("umdDestTab:" + tabId); } catch (e) {}
+});
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.to === "save-file") {
     const ok = sender && sender.tab && /^http:\/\/127\.0\.0\.1:\d+\/[\w-]+$/.test(msg.url || "");
     if (!ok) { sendResponse({ ok: false }); return false; }
-    chrome.downloads.download({ url: msg.url, filename: String(msg.name || "song.mp3").replace(/[\\/:*?"<>|]/g, "_"), conflictAction: "uniquify" },
-      (id) => sendResponse({ ok: !!id, error: chrome.runtime.lastError && chrome.runtime.lastError.message }));
+    let fname = String(msg.name || "song.mp3").replace(/[\\/:*?"<>|]/g, "_");
+    // Optional subfolder inside the browser's download directory
+    // ("AMD/Reddit"): relative only, no traversal, no absolute paths.
+    const sub = String(msg.subdir || "").replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "");
+    if (sub) {
+      if (!/^[\w .()\-]+(\/[\w .()\-]+)*$/.test(sub) || sub.includes("..")) {
+        sendResponse({ ok: false, error: "Bad destination folder." });
+        return false;
+      }
+      fname = sub + "/" + fname;
+    }
+    chrome.downloads.download({ url: msg.url, filename: fname, conflictAction: "uniquify", saveAs: !!msg.saveAs },
+      (id) => {
+        sendResponse({ ok: !!id, error: chrome.runtime.lastError && chrome.runtime.lastError.message });
+        // Destination history is written only when the file has actually
+        // finished saving - never on selection, start, or failure. The
+        // staged-cleanup signal rides the same completion watch, so the
+        // listener registers even without a label ("Ask each time" saves).
+        const label = String(msg.label || "");
+        const hasJob = !!String(msg.job || "");
+        if (!id || (!label && !hasJob)) return;
+        const onChanged = (d) => {
+          if (d.id !== id || !d.state) return;
+          if (d.state.current !== "complete" && d.state.current !== "interrupted") return;
+          chrome.downloads.onChanged.removeListener(onChanged);
+          if (d.state.current !== "complete") return;
+          if (label) try {
+            chrome.storage.local.get(["umdDests"], (rr) => {
+              const list = [label].concat(((rr && rr.umdDests) || []).filter((x) => x !== label)).slice(0, 8);
+              chrome.storage.local.set({ umdDests: list });
+            });
+          } catch (e) {}
+          // The browser has its copy; the helper's staged copy can go. An
+          // interrupted save keeps the staged file (24h sweep owns it), so a
+          // fresh retry of the whole download is never the only way back.
+          const job = String(msg.job || "");
+          if (job) {
+            try {
+              if (ensurePort()) {
+                port.postMessage({ to: "bridge", cmd: "discard-staged", job: job,
+                                   id: "r" + Date.now().toString(36) + "-" + (++seq) });
+              }
+            } catch (e) {}
+          }
+        };
+        chrome.downloads.onChanged.addListener(onChanged);
+      });
+    return true;
+  }
+  // Per-tab destination state: a custom folder chosen in one tab survives
+  // page reloads and SPA navigation in THAT tab only, and is wiped when the
+  // tab closes. Tabs never see each other's choice.
+  if (msg && msg.to === "umd-dest-get") {
+    const tid = sender && sender.tab && sender.tab.id;
+    if (typeof tid !== "number") { sendResponse({ ok: false }); return false; }
+    chrome.storage.session.get(["umdDestTab:" + tid], (r) => {
+      sendResponse({ ok: true, state: (r && r["umdDestTab:" + tid]) || null });
+    });
+    return true;
+  }
+  if (msg && msg.to === "umd-dest-set") {
+    const tid = sender && sender.tab && sender.tab.id;
+    if (typeof tid !== "number") { sendResponse({ ok: false }); return false; }
+    const st = msg.state && typeof msg.state === "object"
+      ? { dest: String(msg.state.dest || "").slice(0, 300), saveAsOnce: !!msg.state.saveAsOnce }
+      : { dest: "", saveAsOnce: false };
+    chrome.storage.session.set({ ["umdDestTab:" + tid]: st }, () => sendResponse({ ok: true }));
     return true;
   }
   if (msg && msg.cmd === "open-downloads-tab") {

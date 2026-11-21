@@ -72,6 +72,10 @@ _send_lock = threading.Lock()
 _jobs = {}
 _jobs_lock = threading.Lock()
 _active_procs = {}
+# Rids whose download finished AND left a staged copy under TMP_DIR in THIS
+# process. discard-staged only ever removes these: an id a page or a crafted
+# message made up, or a job a sibling helper process still owns, is refused.
+_finished_staged = set()
 
 
 def log(msg):
@@ -167,6 +171,25 @@ def friendly_error(stderr_text):
     msg = lines[-1] if lines else "The downloader could not read that page."
     msg = re.sub(r"^ERROR:\s*(\[[^\]]*\]\s*)?", "", msg)
     low = msg.lower()
+    # Reddit's refusals need their own words: the engine can hit an IP-level
+    # wall, gated communities, or a plain anonymous-access refusal, and the
+    # generic "needs a login" line below used to claim one cause for all three.
+    # Gated on the extractor's own [reddit] tag so the same engine phrase from
+    # another site is never mislabelled as Reddit.
+    raw_low = clean(stderr_text).lower()
+    if "[reddit]" in raw_low:
+        if "ip address is unable to access the reddit api" in low:
+            return "Reddit blocked this network's API request for this post."
+        if "quarantined subreddit" in low:
+            return ("This subreddit is quarantined, so the post needs a Reddit "
+                    "account that has opted in to quarantined communities.")
+        if "private subreddit" in low:
+            return ("This subreddit is private, so the post needs an approved "
+                    "Reddit account.")
+        if "account authentication is required" in low:
+            return ("Reddit refused anonymous access to this post. A signed-in "
+                    "Reddit account may work, but Reddit can also block whole "
+                    "networks, so signing in is not a guaranteed fix.")
     if any(k in low for k in ("login", "sign in", "cookies", "log in", "private")):
         return ("This page needs a site login. The helper only fetches public "
                 "content, so this one is not downloadable.")
@@ -467,10 +490,41 @@ STALE_SOURCE_RE = re.compile(
     r"(unable to download video data|Got error): HTTP Error (403|404|410)")
 
 
-def run_download(rid, url, kind, selector, mp3, name=""):
+def resolve_dest(raw):
+    """Validate a user-chosen ABSOLUTE download folder typed in the AMD menu.
+    Returns (Path, None) when usable, (None, "not-absolute") for relative
+    input (the browser's own download manager owns those as subfolders of
+    its download directory), or (None, message) for unusable paths."""
+    s = str(raw or "").strip().replace("\x00", "")
+    if not s:
+        return None, None
+    if len(s) > 300:
+        return None, "That folder path is too long."
+    try:
+        p = Path(s).expanduser()
+        if not p.is_absolute():
+            return None, "not-absolute"
+        p = p.resolve()
+        if p.exists() and not p.is_dir():
+            return None, "That path is a file, not a folder."
+        p.mkdir(parents=True, exist_ok=True)
+        if not os.access(str(p), os.W_OK):
+            return None, "AMD cannot write to that folder."
+        return p, None
+    except Exception as e:
+        log("resolve_dest failed for %r: %r" % (s, e))
+        return None, "That folder cannot be used."
+
+
+def run_download(rid, url, kind, selector, mp3, name="", target_dir=None):
     proc = None
     try:
-        DL_DIR.mkdir(parents=True, exist_ok=True)
+        # Default flow stages into a private per-job folder: the browser's own
+        # download manager makes the only user-visible copy, so nothing
+        # duplicates into ~/Downloads. Only an explicit absolute destination
+        # writes straight to its final folder.
+        out_dir = target_dir or (TMP_DIR / rid)
+        out_dir.mkdir(parents=True, exist_ok=True)
         # Use unique template with timestamp to avoid conflicts
         import time
         timestamp = int(time.time() * 1000) % 100000  # Last 5 digits of ms timestamp
@@ -478,7 +532,7 @@ def run_download(rid, url, kind, selector, mp3, name=""):
         if name:
             tmpl = name + "_" + str(timestamp) + ".%(ext)s"
         args = base_args() + extra_headers(url) + [
-            "--newline", "--paths", str(DL_DIR),
+            "--newline", "--paths", str(out_dir),
             "--no-overwrites",
             "--restrict-filenames",
             "-o", tmpl]
@@ -598,7 +652,7 @@ def run_download(rid, url, kind, selector, mp3, name=""):
             send({"type": "error", "job": rid,
                   "error": "The streams downloaded but could not be merged "
                            "(FFmpeg stopped working). The separate files are in "
-                           "Downloads/UMD; re-run the setup script to repair, "
+                           + str(out_dir) + "; re-run the setup script to repair, "
                            "then download again."})
             return
         if r["ret"] == 0:
@@ -611,14 +665,26 @@ def run_download(rid, url, kind, selector, mp3, name=""):
                     final_path = str(pth)
             if not name:
                 try:
-                    newest = max(DL_DIR.iterdir(), key=lambda p: p.stat().st_mtime)
+                    newest = max(out_dir.iterdir(), key=lambda p: p.stat().st_mtime)
                     name = newest.name
                     final_path = str(newest)
                 except Exception:
                     name = "file"
-            # Serve the file so Chrome can download it
+            if target_dir:
+                # Custom absolute folder: the file is already in its final
+                # place, so no browser-side copy is made.
+                send({"type": "done", "job": rid, "file": name, "path": final_path,
+                      "placed": True, "ts": time.time()})
+                return
+            # Serve the staged file so Chrome can download it; the staged
+            # copy is removed only on discard-staged (browser save complete).
+            staged = final_path and str(final_path).startswith(str(TMP_DIR))
             url = serve_once(final_path) if final_path else None
-            send({"type": "done", "job": rid, "file": name, "path": final_path, "url": url, "ts": time.time()})
+            if staged:
+                with _jobs_lock:
+                    _finished_staged.add(rid)
+            send({"type": "done", "job": rid, "file": name, "path": final_path,
+                  "url": url, "staged": bool(staged), "ts": time.time()})
         else:
             if job_cancelled() or (r["ret"] is not None and r["ret"] < 0):
                 send({"type": "error", "job": rid, "error": "Cancelled."})
@@ -669,6 +735,18 @@ def do_download(rid, msg):
     if kind == "audio-mp3" and mp3 not in (128, 192, 256, 320):
         send({"id": rid, "type": "result", "ok": False, "error": "Bad audio quality."})
         return
+    target_dir = None
+    if msg.get("dest"):
+        target_dir, derr = resolve_dest(msg.get("dest"))
+        if derr == "not-absolute":
+            # Relative folders belong to the browser's download manager; the
+            # helper only stages (run_download's default per-job temp dir) and
+            # serves. A truthy target_dir here would wrongly mark the staging
+            # folder as the final placed destination and skip the browser save.
+            target_dir = None
+        elif derr:
+            send({"id": rid, "type": "result", "ok": False, "error": derr})
+            return
     with _jobs_lock:
         if len(_active_procs) >= MAX_CONCURRENT:
             send({"id": rid, "type": "result", "ok": False,
@@ -676,13 +754,15 @@ def do_download(rid, msg):
             return
     send({"id": rid, "type": "result", "ok": True, "job": rid})
     threading.Thread(target=run_download,
-                     args=(rid, url, kind, selector, mp3, name), daemon=True).start()
+                     args=(rid, url, kind, selector, mp3, name, target_dir), daemon=True).start()
 
 
 def serve_once(path):
     """Serve one file once on 127.0.0.1 behind a random token so Chrome's own
     download manager can fetch it. Returns the URL, or None on failure.
-    The file is NOT deleted after serving, so users can find it in the Downloads folder."""
+    The staged copy is kept after serving: the browser's transfer can still
+    fail or be cancelled. It is removed only when the extension reports the
+    browser-side save complete (discard-staged); it is never auto-deleted."""
     try:
         import http.server, secrets, urllib.parse, mimetypes
         token = secrets.token_urlsafe(24)
@@ -713,7 +793,6 @@ def serve_once(path):
                         if not chunk:
                             break
                         self.wfile.write(chunk)
-                # File is kept in Downloads folder for user access
 
         srv = http.server.HTTPServer(("127.0.0.1", 0), H)
         srv.timeout = 120
@@ -746,14 +825,36 @@ SONG_VIDEO_SOURCES = [
 MEDIA_EXT = (".mp3", ".mp4", ".mkv", ".webm", ".m4a")
 
 
-def run_song(rid, query, title, kind="audio-mp3", mp3=320, height=720):
+def run_song(rid, query, title, kind="audio-mp3", mp3=320, height=720,
+               artist="", duration=0, target_dir=None):
     try:
-        TMP_DIR.mkdir(parents=True, exist_ok=True)
-        words = re.findall(r"\w+", title or "", re.U)[:4]
-        # Don't filter by duration - some official audio tracks might be longer
-        flt = ""
-        if words:
-            flt = "title~=(?i)" + ".*".join(re.escape(w) for w in words)
+        out_dir = target_dir or (TMP_DIR / rid)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Filter words come from the plain song name only: bracketed extras
+        # ((From "..."), [Remix], (Slowed)) are the usual reason a correct
+        # upload got rejected. All conditions go into ONE --match-filter
+        # joined with &: yt-dlp ORs repeated --match-filter flags (any() in
+        # match_filter_func), so separate flags would let a candidate pass
+        # on one common word. One & chain keeps every word mandatory but
+        # order-independent: "Mangal Rang (From "Ramayana")" filters on
+        # Mangal + Rang only.
+        core = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", title or "")
+        words = [w for w in re.findall(r"\w+", core, re.U) if len(w) > 1][:3]
+        parts = ["title~=(?i)" + re.escape(w) for w in words]
+        # Wrong-track guards, added only when the player gave us the data:
+        # - exact track length -> accept only uploads within 25s of it
+        #   (drops clips, shorts and unrelated same-title videos);
+        # - a title with under 2 usable words is too generic on its own, so
+        #   the artist's most distinctive word must appear in the title too.
+        if isinstance(duration, int) and duration >= 30:
+            parts += ["duration>?%d" % (duration - 25),
+                      "duration<?%d" % (duration + 25)]
+        if len(words) < 2 and artist:
+            aw = [w for w in re.findall(r"\w+", artist, re.U) if len(w) > 2]
+            if aw:
+                parts.append("title~=(?i)" + re.escape(max(aw, key=len)))
+        filters = [" & ".join(parts)] if parts else []
+        log("song filter: %s (duration=%s, artist=%s)" % (filters, duration or "unknown", artist or "unknown"))
         sources = SONG_VIDEO_SOURCES if kind == "video" else SONG_AUDIO_SOURCES
         if kind == "video":
             fmt = ["-f", "bv*[height<=%d]+ba/b[height<=%d]/b" % (height, height),
@@ -770,14 +871,16 @@ def run_song(rid, query, title, kind="audio-mp3", mp3=320, height=720):
             send({"type": "progress", "job": rid, "pct": 0.0,
                   "stage": "searching " + label, "ts": time.time()})
             args = base_args() + [
-                "--newline", "--paths", str(TMP_DIR),
+                "--newline", "--paths", str(out_dir),
                 "-o", "%(title).120B.%(ext)s",
                 "--max-downloads", "1"] + fmt + [
                 "--print", "after_move:filepath",
                 "--", tmpl % query]
-            if flt:
-                args.insert(-2, "--match-filter")
-                args.insert(-1, flt)
+            if filters:
+                ins = []
+                for f in filters:
+                    ins += ["--match-filter", f]
+                args = args[:-2] + ins + args[-2:]
             proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True)
             with _jobs_lock:
@@ -788,7 +891,7 @@ def run_song(rid, query, title, kind="audio-mp3", mp3=320, height=720):
                 line = line.rstrip("\n")
                 tail.append(line)
                 del tail[:-8]
-                if line.startswith(str(TMP_DIR)) and line.lower().endswith(MEDIA_EXT):
+                if line.startswith(str(out_dir)) and line.lower().endswith(MEDIA_EXT):
                     final = line.strip()
                     continue
                 m = PCT.search(line)
@@ -808,11 +911,20 @@ def run_song(rid, query, title, kind="audio-mp3", mp3=320, height=720):
                 send({"type": "error", "job": rid, "error": "Cancelled."})
                 return
             if proc.returncode in (0, 101) and final and Path(final).exists():
-                url = serve_once(final)
-                # File stays in UMD folder (TMP_DIR which is under UMD)
                 log("song saved: %s" % final)
+                if target_dir:
+                    # Custom absolute folder: already in its final place.
+                    send({"type": "done", "job": rid, "file": Path(final).name,
+                          "path": final, "placed": True, "source": label, "ts": time.time()})
+                    return
+                staged = str(final).startswith(str(TMP_DIR))
+                if staged:
+                    with _jobs_lock:
+                        _finished_staged.add(rid)
+                url = serve_once(final)
                 send({"type": "done", "job": rid, "file": Path(final).name,
-                      "path": final, "url": url, "source": label, "ts": time.time()})
+                      "path": final, "url": url, "staged": bool(staged),
+                      "source": label, "ts": time.time()})
                 return
             last_err = friendly_error("\n".join(tail))
             log("song source %s failed: %s" % (label, last_err))
@@ -833,6 +945,21 @@ def do_song(rid, msg):
     kind = "video" if msg.get("kind") == "video" else "audio-mp3"
     mp3 = msg.get("mp3") if msg.get("mp3") in (128, 192, 256, 320) else 320
     height = msg.get("height") if msg.get("height") in (360, 480, 720, 1080, 1440, 2160) else 720
+    artist = re.sub(r"\s+", " ", str(msg.get("artist") or "")).strip()[:150]
+    target_dir = None
+    if msg.get("dest"):
+        target_dir, derr = resolve_dest(msg.get("dest"))
+        if derr == "not-absolute":
+            target_dir = None  # relative: browser saves into the subfolder
+        elif derr:
+            send({"id": rid, "type": "result", "ok": False, "error": derr})
+            return
+    try:
+        duration = int(msg.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    if not 30 <= duration <= 36000:
+        duration = 0
     if len(q) < 2:
         send({"id": rid, "type": "result", "ok": False, "error": "No song name."})
         return
@@ -847,7 +974,9 @@ def do_song(rid, msg):
             return
         _jobs[rid] = {"state": "running"}
     send({"id": rid, "type": "result", "ok": True, "job": rid})
-    threading.Thread(target=run_song, args=(rid, q, title, kind, mp3, height),
+    threading.Thread(target=run_song,
+                     args=(rid, q, title, kind, mp3, height, artist, duration,
+                           target_dir),
                      daemon=True).start()
 
 
@@ -925,7 +1054,8 @@ def do_ping(rid):
     # of a freshly downloaded engine can take far longer than the popup's
     # boot gate, and a slow version check must not look like a dead helper.
     send({"id": rid, "type": "result", "ok": True,
-          "download_dir": str(DL_DIR)})
+          "download_dir": str(DL_DIR),
+          "dest_support": True})
 
 
 def do_versions(rid):
@@ -956,15 +1086,57 @@ def do_versions(rid):
           "versions": VERSION_CACHE["versions"]})
 
 
-def do_open_downloads(rid):
+def do_discard_staged(rid, msg):
+    job = str((msg or {}).get("job") or "")
+    if not re.match(r"^[\w-]+$", job):
+        send({"id": rid, "type": "result", "ok": False, "error": "Bad job id."})
+        return
+    with _jobs_lock:
+        # Ownership check: only a job this process finished staging may be
+        # discarded, and never one still active here. Anything else (a job a
+        # sibling helper owns, an id the page or a crafted message made up)
+        # is refused, so a user/page-controlled id cannot delete another
+        # job's data.
+        if job in _active_procs or job not in _finished_staged:
+            send({"id": rid, "type": "result", "ok": False,
+                  "error": "Unknown or unfinished job."})
+            return
+    d = (TMP_DIR / job)
     try:
-        DL_DIR.mkdir(parents=True, exist_ok=True)
+        # resolve() without strict: refuse anything that escapes the staging
+        # root, and never follow a symlinked job folder.
+        rp = d.resolve()
+        if d.is_symlink() or not str(rp).startswith(str(TMP_DIR.resolve())):
+            send({"id": rid, "type": "result", "ok": False, "error": "Bad job folder."})
+            return
+        if d.is_dir():
+            shutil.rmtree(str(d), ignore_errors=True)
+        with _jobs_lock:
+            _finished_staged.discard(job)
+        send({"id": rid, "type": "result", "ok": True})
+    except Exception as e:
+        log("discard-staged error: %r" % e)
+        send({"id": rid, "type": "result", "ok": False,
+              "error": "Could not clear the staged copy."})
+
+
+def do_open_downloads(rid, msg=None):
+    try:
+        folder = DL_DIR
+        # After a custom-destination save, open the folder the file is
+        # actually in. Only an existing directory is accepted.
+        req = (msg or {}).get("path")
+        if req:
+            cand = Path(req).expanduser()
+            if cand.is_dir():
+                folder = cand
+        folder.mkdir(parents=True, exist_ok=True)
         if os.name == "nt":
-            os.startfile(str(DL_DIR))
+            os.startfile(str(folder))
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(DL_DIR)])
+            subprocess.Popen(["open", str(folder)])
         else:
-            subprocess.Popen(["xdg-open", str(DL_DIR)],
+            subprocess.Popen(["xdg-open", str(folder)],
                              stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
         send({"id": rid, "type": "result", "ok": True})
@@ -1006,8 +1178,10 @@ def main():
                 do_song(rid, req)
             elif cmd == "cancel":
                 do_cancel(rid, req)
+            elif cmd == "discard-staged":
+                do_discard_staged(rid, req)
             elif cmd == "open-downloads":
-                do_open_downloads(rid)
+                do_open_downloads(rid, req)
             elif cmd == "update-engine":
                 do_update(rid)
             else:
@@ -1061,8 +1235,34 @@ def _sweep_info_orphans():
         pass
 
 
+def _sweep_song_tmp():
+    # Staged copies whose browser-side save never completed (closed tab,
+    # killed helper) are KEPT, however old: file mtimes cannot prove a job is
+    # inactive across helper processes (a paused or waiting job may hold
+    # files it is not writing), so no aged data is ever auto-deleted. This
+    # sweep only removes empty job folders. Symlinks are never followed or
+    # removed. Loose files directly in the staging root are kept too.
+    try:
+        if not TMP_DIR.is_dir():
+            return
+        for entry in TMP_DIR.iterdir():
+            try:
+                if entry.is_symlink() or not entry.is_dir():
+                    continue
+                if not any(entry.iterdir()):
+                    try:
+                        entry.rmdir()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     _sweep_info_orphans()
+    _sweep_song_tmp()
     threading.Thread(target=warm_engine, daemon=True).start()
     log("bridge started (python " + sys.version.split()[0] + ")")
     try:
